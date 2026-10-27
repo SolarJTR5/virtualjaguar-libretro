@@ -1,0 +1,20 @@
+; test/tools/pipe_sim/gpu_particle_naive.txt
+;
+; The program of benchgpu_particle_naive_gpu.s (the immediate-consume
+; control), as pipe_sim.py wants it:
+;
+;   [0..10]    setup + load P0
+;   [11..35]   the SAME 25-instruction body as the deep payload, 256
+;              times, with the two MULTs immediately after the DIV
+;   [36..48]   sentinels + halt
+;
+; Same note as the deep program: pipe_sim charges the delay slot, the
+; core folds it (256+1 instructions fewer here).
+
+mem ext 0x00020000 counter 1024
+mem ext 0x00030000 zero 1024
+
+0..10
+repeat 256:
+  11..35
+36..48

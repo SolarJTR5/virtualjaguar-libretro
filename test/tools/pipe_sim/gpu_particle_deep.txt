@@ -1,0 +1,28 @@
+; test/tools/pipe_sim/gpu_particle_deep.txt
+;
+; The program of benchgpu_particle_gpu.s (the 2-deep particle
+; transform), as pipe_sim.py wants it.  Instruction indices are the
+; assembled payload's:
+;
+;   [0..24]    prologue: setup, load P0, integrate P0, save numerands,
+;              divide P0, load P1
+;   [25..49]   the 25-instruction steady-state body, 255 times
+;              (one per remaining particle; the epilogue consumes P255)
+;   [50..69]   epilogue consume, sentinels, halt
+;
+; Rebuild the blob with:
+;   lyxass -D 'BASE=$F03200' -D 'CTRL=$00F02114' -o x.o benchgpu_particle_gpu.s
+;   tail -c +13 x.o > x.bin
+;
+; NOTE pipe_sim counts the jump delay slot as an instruction; the core
+; folds it into the jump, so the core's issue total is exactly 255+1
+; lower than pipe_sim's.  The per-opcode stall histograms are unaffected
+; and are the field that must match.
+
+mem ext 0x00020000 counter 1024
+mem ext 0x00030000 zero 1024
+
+0..24
+repeat 255:
+  25..49
+50..69

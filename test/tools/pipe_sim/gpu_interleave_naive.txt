@@ -1,0 +1,21 @@
+; test/tools/pipe_sim/gpu_interleave_naive.txt
+;
+; The program of benchinterleave_naive.s (the naive vertex schedule), as
+; pipe_sim.py wants it: the setup, then the loop body 64 times.  The
+; instruction indices are the ASSEMBLED payload's -- the payload is
+; assembled for the address it runs at, and the simulator decodes the
+; same blob the core does.
+;
+;   cd test/microbench
+;   lyxass -D BASE=$F03000 -D CTRL=$00F02114 -o x.o benchinterleave_naive.s
+;   tail -c +13 x.o > x.bin
+;   python3 test/tools/pipe_sim.py x.bin gpu \
+;       test/tools/pipe_sim/gpu_interleave_naive.txt
+
+; The vertex buffer: the 68K fills main RAM with x=i, y=i+1, z=i+2,
+; a spare word, 16 bytes per vertex (benchgpu_interleave.s).
+mem ext 0x00020000 vertex 64
+
+0..16
+repeat 64:
+  17..44

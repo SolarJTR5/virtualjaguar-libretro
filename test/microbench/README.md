@@ -12,6 +12,11 @@ single-engine isolation or an exact, deterministic termination.
 | `benchgpu_branch.j64` | GPU, branch-heavy | control flow (`JR`/`NOP` delay-slot pairs, taken `JUMP`) out of GPU local RAM -- structurally immune to the write-back conflict that hits the arith ROM | `$C0DE0B02` | shipped (task 3) |
 | `benchdsp.j64` | DSP | the same 20-instruction ALU body as `benchgpu_arith.j64`, run on the DSP interpreter instead of the GPU's -- a direct same-clock GPU-vs-DSP comparison, and proof the DSP has no `virtualjaguar_gpu_pipeline_timing`-equivalent cost model | `$C0DE0D53` | shipped (task 4) |
 | `benchblit.j64` | blitter | fixed-count 32x32 8bpp PATDSEL solid-fill launches to main RAM -- the only ROM whose hot path touches external memory every iteration, so it responds to `virtualjaguar_dram_timing` and `virtualjaguar_blitter_timing` where the other four don't | `$C0DE0B17` | shipped (task 5) |
+| `benchdsp_interleave.j64` | DSP, 3D vertex pipeline | the same three schedules as the GPU ROM below, but on Jerry's RISC -- which is the more interesting target: the audio path has no FIFO between the mix and the I2S interrupt, and Jerry reaches external memory over a 16-bit bus, so its loads are slower. Same shared payload sources, assembled once per core | `$C0DE0A03` | shipped (task 7) |
+| `benchdsp_mix.j64` | DSP, audio mix | the workload that makes the method *mandatory* rather than optional: a 4-voice mix per sample, **published** to the DAC (LTXD/RTXD). There is no FIFO between the mix and the I2S interrupt, so an unfinished sample cannot be held back -- it has to be finished in time. Carries both schedules (1-deep and 2-deep) and picks one from the harness's flag; the envelopes live in MAIN RAM (one DRAM page per voice, so the reads are external and slow), the wavetable in the DSP's local RAM. Reports ticks per *published sample* against the I2S period (576 ticks at 46.2 kHz, 1280 at 20.8 kHz) | `$C0DE0A04` | shipped (task 8) |
+| `benchgpu_interleave.j64` | GPU, 3D vertex pipeline | a software-pipelined vertex transform on the GPU RISC -- three MAC dot products, a perspective divide (the long op: 1 tick to issue, 16 ticks of background divide), the perspective multiplies -- with the vertices in MAIN RAM so the three loads per vertex are external accesses. Carries BOTH schedules and picks one at run time from a flag the harness writes into main RAM: the naive one consumes the quotient immediately (the divide's window shows up as a scoreboard stall), the interleaved one drops 16 independent, flag-transparent instructions into that window. The only ROM that reports the RISC's own tick counters, so it is the only one that can see the divide's background window at all -- the frame count cannot | `$C0DE0A03` | shipped (task 6) |
+| `benchgpu_particle.j64` | GPU, particle transform | 256 particles through Euler integration + a fixed-point perspective divide, input and output in separate main-RAM buffers. The 2-deep member of an A/B pair whose two payloads are a *verified permutation* of one another (same 25 instructions, same operands, only the two MULTs move relative to the DIV), so the measured delta is placement and nothing else. The output buffer is checked bit for bit against an integer reference -- this is the ROM that exposed the timing-only harness | `$C0DE0B01` | shipped (task 9) |
+| `benchgpu_particle_naive.j64` | GPU, particle transform | the immediate-consume control for the ROM above: identical instruction multiset, MULTs right after the DIV. Must show a large scoreboard count or the A/B proves nothing; the harness asserts that too | `$C0DE0B01` (same DONE magic, different `VARIANT` sentinel) | shipped (task 9) |
 
 Run them:
 
@@ -29,6 +34,22 @@ exercise:
 ```
 MICROBENCH engine=68k done=1 done_frame=114 start_frame=1 count=1000000 expect_count=1000000 budget=600
 ```
+
+The RISC tools also print the RISC's **per-opcode** stall histogram when
+`VJ_ILV_HIST=1` is set (on stderr), which is the diagnostic a schedule
+author needs:
+
+```
+ILV hist 2-deep: raw by opcode: mult=126 div=64 cmp=63 store=3  | score by opcode: imacn=8
+```
+
+⇒⇒□ `test/tools/pipe_sim.py` re-implements the core's pipeline timing model
+in Python and runs the **same assembled payload** on it.  Its per-opcode
+histogram must match the core's exactly -- that is the check that the model
+is the model the core runs -- and once it does, it can print the
+tick-by-tick timeline, which is where the "why" comes from (see
+`docs/jaguar_risc_interleave.md` §12.1d).  The program descriptions live
+in `test/tools/pipe_sim/`.
 
 The `.j64` images are **committed**, so CI never needs an assembler. Regenerate
 them only after editing a `.s`:
@@ -338,6 +359,75 @@ either processor). Because 631 exceeds the other ROMs' 600-frame budget,
 deliberate, documented difference, not an oversight (see the tool's own
 comment).
 
+### The interleave ROM measures the RISC's tick counters, not frames
+
+`benchgpu_interleave.j64` is the first ROM in this set whose *result* is
+not a frame count. The frame count cannot see the divide's background
+window: a divide that issues in 1 tick and takes 16 ticks of background
+work looks identical to a divide that takes 17 ticks, unless something
+else is stalled behind it.
+
+So this ROM reports the GPU's own pipeline counters (the test ABI's
+per-cause stall breakdown: `gpu_pipe_ticks_total`, `gpu_pipe_issue_total`
+and the score/RAW/port/flags stalls). The GPU clears its own `GPUGO` when
+it is done, which freezes the counters, so the harness can read them
+exactly.
+
+It also runs the ROM **twice** -- once per schedule -- by loading the ROM
+again between the runs (`retro_load_game` resets the machine, which clears
+both main RAM and the tick counters) and writing the schedule flag into
+main RAM in between. Same ROM, same buffers, same bus traffic; only the
+GPU's instruction placement differs.
+
+Measured (64 vertices, the default configuration):
+
+| schedule | instructions | ticks | scoreboard stalls | ticks/vertex |
+|---|---|---|---|---|
+| naive (the quotient is consumed at once) | 1818 | 4713 | 1472 | 73.64 |
+| interleaved (16 instructions in the divide's window) | 2842 | 4841 | 512 | 75.64 |
+
+⇒ **1024 extra instructions (16 per vertex) for 128 extra ticks (2 per
+vertex): the marginal price of a shadow instruction is 0.125 ticks
+instead of ~1.** The scoreboard stalls drop by 960 -- exactly the
+divide's 15 ticks per vertex. The vertex rate itself is 2.7% *slower*,
+because the shadow is not free in the strict sense: it is free against
+the divide's window, but the loop's own work still has to happen.
+
+The ROM also carries a **third** schedule, the 2-deep software pipeline
+(flag 2), which keeps two vertices in flight so the loads land a full
+iteration before their use:
+
+| schedule | GPU instr | GPU ticks | GPU score | GPU ticks/vertex | DSP ticks/vertex | DSP score |
+|---|---|---|---|---|---|---|
+| naive | 1818 | 4713 | 1472 | 73.64 | 79.69 | 1664 |
+| interleaved (1 deep, 16 filler ops) | 2842 | 4841 | 512 | 75.64 | 81.69 | 704 |
+| **2-deep** | **1814** | **3314** | **8** | **51.78** | **54.98** | **12** |
+
+⇒ On the DSP the 1-deep interleave is **not enough** -- Jerry's 16-bit
+external bus makes the load stall bigger than the 16-tick divide window
+can absorb (the score stalls only fall 1664 -> 704, not -> 512).  The
+2-deep pipeline handles it anyway (704 -> 12), and its gain is bigger
+than the GPU's: **79.69 -> 54.98 ticks/vertex, 31%**.
+
+⇒ The 2-deep pipeline is a **30% better vertex rate** *and* it needs
+**no filler instructions at all** -- the divide's window is filled with
+the next vertex's real work, and the loads' latency is hidden by the
+same one-iteration gap. It uses **no extra registers**: the pipeline
+reuses the same coordinate and result sets in a different order, which
+is the same "disjoint in time" rule the rotating register allocation
+follows.
+
+(The flag the harness writes into main RAM is **big-endian** -- the 68K
+reads it as a longword and the Jaguar is big-endian. Writing it
+little-endian is what made the 68K see `0x01000000` instead of `1`;
+measured, not assumed.)
+
+With a contended DRAM (`VJ_DRAM_SCALE=8`) the absolute saving is
+unchanged (960 ticks, the same 15 per vertex) but the *ratio* of stalls
+shrinks, because the vertices' own external loads now dominate the stall
+total: 3712 → 2752. That is why the tool's pass condition is an
+absolute saving (>= 10 ticks per vertex) and not a ratio.
+
 ### The blitter ROM is 68K-only
 
 `benchblit.s` has no `benchblit_gpu.s`/`benchblit_dsp.s` companion and no
@@ -360,6 +450,118 @@ retires — there is no modeled "blitter running in the background" state for
 a poll to observe. The poll is included because it is what real Jaguar code
 does and because the ROM should look like a plausible blit-launch loop, not
 because it changes this ROM's timing on this core.
+
+---
+
+## The particle-transform pair — and how to prove a ROM, not just time it
+
+`benchgpu_particle.j64` runs 256 particles through
+
+```
+x += vx ; y += vy ; vx += 1 ; vy += 1
+q     = 65536 / y            <- the long op
+out_x = x * q ; out_y = y * q
+```
+
+with the input at `$020000` and the output at `$030000` (the 68K bootstrap
+clears the output first, so a payload that silently stops storing cannot
+hide behind stale RAM).  `benchgpu_particle_naive.j64` is the same math on
+the same data with the two `mult`s moved next to the `div`.
+
+### The bug this pair was built to catch
+
+The first revision of this ROM stored through the **input** cursor:
+
+```
+store r29,(r14)
+store r30,(r14+4)
+addq  #16,r14
+```
+
+so particle *k*'s result overwrote particle *k+1*'s x,y and was read back
+as input.  A live `gdb` read of `$020000` showed `P1=(0,0,5,6)` where the
+68K had written `P1=(3,4,5,6)`: from P1 on, the "simulation" integrated
+zeros.
+
+It still finished 256 particles and still scored **10** stall ticks, so it
+**passed** the old harness.  That is the failure mode the current harness
+closes: `test_microbench_gpu_particle.c` now recomputes all 256 outputs in
+C and compares them word for word (`data_bad=` in the MICROBENCH line).
+The original payload is kept as a regression control in
+`known_bad/` — rebuild it with `known_bad/build.sh` and it fails with
+`data_bad=256 first bad P0`.
+
+### Why the A/B is a controlled experiment
+
+`test/tools/check_particle_permutation.py` decodes both assembled blobs,
+locates the steady-state loop (via the `movei #loop,r13` target) and
+asserts the two 25-instruction bodies are the **same multiset** — same op,
+same operands, same count:
+
+```
+$ python3 test/tools/check_particle_permutation.py deep.bin naive.bin
+OK: body instruction multisets are IDENTICAL (25 instructions)
+```
+
+The only difference is where four instructions sit:
+
+| | 2-deep | naive |
+|---|---|---|
+| `move r8,r29` / `mult r28,r29` / `move r9,r30` / `mult r28,r30` | top of the body, consuming the *previous* iteration's quotient | immediately after `div`, waiting on it |
+
+So the measured difference cannot be explained by "more work" or
+"different data".
+
+### Measured
+
+| `VJ_DRAM_SCALE` | 2-deep ticks | naive ticks | 2-deep t/p | naive t/p | saved |
+|---|---|---|---|---|---|
+| 1 | 14142 | 18497 | 55.24 | 72.25 | 23.5% |
+| 2 | 16734 | 23637 | 65.37 | 92.33 | 29.2% |
+| 4 | 26249 | 33917 | 102.54 | 132.49 | 22.6% |
+| 8 | 46809 | 54477 | 182.85 | 212.80 | 14.1% |
+
+Scoreboard stalls: **9 vs 4101** at scale 1 (14 vs 5381 at 2, 24 vs 7941
+at 4).  The deep run's handful of stalls are the load→`add` boundary, not
+the divide; the naive run's 3840 `mult` stalls are the divide window,
+exposed once per particle (15 ticks × 256).
+
+`pipe_sim.py` on the same payloads:
+
+| | core ticks | model ticks | core instr | model instr | score stalls |
+|---|---|---|---|---|---|
+| 2-deep | 14142 | 14408 | 6164 | 6420 | add=9 / add=9 |
+| naive | 18497 | 18764 | 6167 | 6424 | add=261 mult=3840 / add=6 mult=3840 |
+
+The instruction offset is the jump delay slot: the core folds it into the
+jump, the model charges it, so model = core + iterations + 1.  The tick
+offset is that plus a constant 10 ticks of prologue accounting, in both
+runs.  **The schedule's value agrees to 1 tick out of 4356** (core saved
+4355, model 4356).  The one histogram difference is the naive control's
+`add` count: the core's per-access DRAM cost comes from
+`bus_arbiter_charge_access` (address/page dependent) while the model uses
+a constant, and at the load→`add` boundary that moves a 1-tick wait
+between the scoreboard and bus counters.  The `mult` signal — the thing
+being measured — matches exactly.
+
+### Running the proof
+
+```bash
+make particle-verify
+```
+
+or directly (needs `gdb` and `python3`, no compiler):
+
+```bash
+test/tools/particle_ab.sh
+```
+
+It (1) regenerates the blobs and checks the permutation, (2) runs both
+ROMs, (3) reads the output buffer live out of the running core with
+`dump binary memory` at a `harness_report` breakpoint and compares it to
+`test/tools/particle_reference.py`, and (4) cross-checks both tick totals
+against `pipe_sim.py`.  `make microbench` also runs both ROMs and asserts
+each one's expected stall profile.
 
 ---
 

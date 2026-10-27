@@ -1336,7 +1336,7 @@ $(CORE_DIR)/libretro.o: $(VERSION_H)
 clean:
 	rm -f $(TARGET) $(OBJECTS) $(BUILD_CONFIG_STAMP) $(LEGACY_LINK_MODE_STAMP) \
 		test/test_cheat test/test_event_queue test/test_blitter_simd \
-		test/test_dsp_mac40 test/test_m68k_ops test/test_m68k_irq_ssp test/test_m68k_prefetch test/test_gpu_ops test/test_mmult test/test_tom_readback \
+		test/test_dsp_mac40 test/test_m68k_ops test/test_m68k_irq_ssp test/test_m68k_prefetch test/test_gpu_ops test/test_gpu_interleave test/test_mmult test/test_tom_readback \
 		test/test_dsp_ops test/test_dsp_unit test/test_hle_bios \
 		test/test_subsystem_init test/test_subsystem_timeline \
 		test/test_irq_cascade test/test_boot_patterns test/test_fountain_crash test/test_audio_pipeline \
@@ -1414,7 +1414,7 @@ test: export VJ_EXPECT_BUILD := $(shell ./scripts/build-id.sh)
 test: EEPROM_GEN_TOOL := /tmp/vj_gen_eeprom_test_rom_$(shell echo $$PPID)
 test: EEPROM_FIXTURE := /tmp/vj_eeprom_lifecycle_$(shell echo $$PPID).j64
 test: test/test_dram_timing test/test_cheat test/test_event_queue test/test_jlink test/test_jlink_tcp test/test_jlink_discover test/test_voicechat test/test_jlink_netpacket test/test_voicemodem_netpacket test/test_voice_netpacket test/test_uart_loopback test/test_jlink_negotiate test/test_blitter_simd test/test_dsp_mac40 test/test_titledb test/test_titlehook test/test_biosdb test/tools/test_gdbstub_proto \
-		$(TARGET) test/test_m68k_ops test/test_m68k_irq_ssp test/test_m68k_prefetch test/test_gpu_ops test/test_mmult test/test_tom_readback test/test_dsp_ops \
+		$(TARGET) test/test_m68k_ops test/test_m68k_irq_ssp test/test_m68k_prefetch test/test_gpu_ops test/test_gpu_interleave test/test_mmult test/test_tom_readback test/test_dsp_ops \
 		test/test_dsp_unit test/test_hle_bios test/test_subsystem_init \
 		test/test_subsystem_timeline test/test_irq_cascade test/test_boot_patterns \
 		test/test_fountain_crash \
@@ -1585,6 +1585,7 @@ test: test/test_dram_timing test/test_cheat test/test_event_queue test/test_jlin
 	./test/test_m68k_irq_ssp
 	./test/test_m68k_prefetch
 	./test/test_gpu_ops
+	./test/test_gpu_interleave
 	./test/test_mmult
 	./test/test_tom_readback
 	./test/test_dsp_ops
@@ -2738,6 +2739,10 @@ test/test_gpu_ops: test/test_gpu_ops.c
 	$(CC) -O2 -Wall -Wno-unused-function -std=c99 $(INCFLAGS) \
 		-o $@ test/test_gpu_ops.c -ldl
 
+test/test_gpu_interleave: test/test_gpu_interleave.c
+	$(CC) -O2 -Wall -Wno-unused-function -std=c99 $(INCFLAGS) \
+		-o $@ test/test_gpu_interleave.c -ldl
+
 test/test_dsp_ops: test/test_dsp_ops.c
 	$(CC) -O2 -Wall -Wno-unused-function -std=c99 $(INCFLAGS) \
 		-o $@ test/test_dsp_ops.c -ldl
@@ -2894,6 +2899,34 @@ test/tools/test_microbench_gpu_arith: test/tools/test_microbench_gpu_arith.c \
 		test/harness/harness.c test/harness/harness.h
 	$(CC) -O2 -Wall -std=c99 $(INCFLAGS) \
 		-o $@ test/tools/test_microbench_gpu_arith.c \
+		test/harness/harness.c \
+		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
+
+test/tools/test_microbench_gpu_interleave: test/tools/test_microbench_gpu_interleave.c \
+		test/harness/harness.c test/harness/harness.h
+	$(CC) -O2 -Wall -std=c99 $(INCFLAGS) \
+		-o $@ test/tools/test_microbench_gpu_interleave.c \
+		test/harness/harness.c \
+		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
+
+test/tools/test_microbench_gpu_particle: test/tools/test_microbench_gpu_particle.c \
+		test/harness/harness.c test/harness/harness.h
+	$(CC) -O2 -Wall -std=c99 $(INCFLAGS) \
+		-o $@ test/tools/test_microbench_gpu_particle.c \
+		test/harness/harness.c \
+		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
+
+test/tools/test_microbench_dsp_interleave: test/tools/test_microbench_dsp_interleave.c \
+		test/harness/harness.c test/harness/harness.h
+	$(CC) -O2 -Wall -std=c99 $(INCFLAGS) \
+		-o $@ test/tools/test_microbench_dsp_interleave.c \
+		test/harness/harness.c \
+		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
+
+test/tools/test_microbench_dsp_mix: test/tools/test_microbench_dsp_mix.c \
+		test/harness/harness.c test/harness/harness.h
+	$(CC) -O2 -Wall -std=c99 $(INCFLAGS) \
+		-o $@ test/tools/test_microbench_dsp_mix.c \
 		test/harness/harness.c \
 		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
 
@@ -3551,12 +3584,22 @@ MICROBENCH_TOOLS := test/tools/test_microbench_68k \
                      test/tools/test_microbench_gpu_arith \
                      test/tools/test_microbench_gpu_branch \
                      test/tools/test_microbench_dsp \
-                     test/tools/test_microbench_blit
+                     test/tools/test_microbench_blit \
+                     test/tools/test_microbench_gpu_interleave \
+                     test/tools/test_microbench_dsp_interleave \
+                     test/tools/test_microbench_dsp_mix \
+                     test/tools/test_microbench_gpu_particle \
+                     test/tools/test_microbench_gpu_particle
 MICROBENCH_ROMS  := test/microbench/bench68k.j64 \
                      test/microbench/benchgpu_arith.j64 \
                      test/microbench/benchgpu_branch.j64 \
                      test/microbench/benchdsp.j64 \
-                     test/microbench/benchblit.j64
+                     test/microbench/benchblit.j64 \
+                     test/microbench/benchgpu_interleave.j64 \
+                     test/microbench/benchdsp_interleave.j64 \
+                     test/microbench/benchdsp_mix.j64 \
+                     test/microbench/benchgpu_particle.j64 \
+                     test/microbench/benchgpu_particle_naive.j64
 
 .PHONY: microbench
 microbench: export VJ_EXPECT_BUILD := $(shell ./scripts/build-id.sh)
@@ -3571,6 +3614,26 @@ microbench:
 		echo "==> $$t $$rom"; \
 		./$$t ./$(TARGET) "$$rom"; \
 	done
+
+# `make particle-verify` -- the full proof for the GPU particle-transform
+# pair (benchgpu_particle.j64 vs benchgpu_particle_naive.j64):
+#
+#   * the two payloads are a controlled permutation of one another
+#     (same 25-instruction multiset, placement only);
+#   * both runs compute the reference values bit for bit, read live out
+#     of the emulated machine;
+#   * the 2-deep schedule's advantage survives as a measured tick delta.
+#
+# Needs gdb and python3, not an assembler -- the .j64 images are
+# committed.  `make microbench` runs the same two ROMs and asserts each
+# one's expected stall profile; this target adds the data check and the
+# cross-schedule comparison.
+.PHONY: particle-verify
+particle-verify: export VJ_EXPECT_BUILD := $(shell ./scripts/build-id.sh)
+particle-verify:
+	$(MAKE) TEST_EXPORTS=1 -j$(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+	$(MAKE) TEST_EXPORTS=1 test/tools/test_microbench_gpu_particle
+	test/tools/particle_ab.sh ./$(TARGET)
 
 # `make dsp-diag` -- DSP audio diagnostic.  Builds core with TEST_EXPORTS=1,
 # compiles the harness + DSP probe, then runs the diagnostic against a ROM.

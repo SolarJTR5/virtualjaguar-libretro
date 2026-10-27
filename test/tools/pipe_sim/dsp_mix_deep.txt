@@ -1,0 +1,37 @@
+; test/tools/pipe_sim/dsp_mix_deep.txt
+;
+; The program of benchdspmix_deep.s (the 2-deep audio mix), as
+; pipe_sim.py wants it: the setup, then 64 samples of 4 voices each.
+; Note the prologue: every sample re-reads voice 0's envelope, because
+; every sample is a new mix of the same voices.
+;
+;   cd test/microbench
+;   lyxass -D BASE=$F1B200 -D CTRL=$00F1A114 -o x.o benchdspmix_deep.s
+;   tail -c +13 x.o > x.bin
+;   python3 test/tools/pipe_sim.py x.bin dsp \
+;       test/tools/pipe_sim/dsp_mix_deep.txt
+
+; The 68K builds the envelopes in main RAM (one DRAM page per voice,
+; the volume = the voice number) and the wavetable in the DSP's local
+; RAM (one longword per sample).
+mem ext 0x00020000 envelope 4
+mem local 0x00F1B400 counter 64
+
+0..8
+repeat 64:
+  9..14
+  15..15  ext      # the prologue: voice 0's envelope
+  16..16
+  repeat 4:
+    17..17  ext    # the NEXT voice's envelope, in flight
+    18..18
+    19..19  local  # the wavetable (DSP local RAM)
+    20..33
+  35..35
+  36..36  io      # LTXD
+  37..37
+  38..38  io      # RTXD
+  39..43
+45..46
+47..49
+50..52  io       # the park: DSPGO = 0

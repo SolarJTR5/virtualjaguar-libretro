@@ -1,0 +1,36 @@
+; test/tools/pipe_sim/dsp_mix_naive.txt
+;
+; The program of benchdspmix_naive.s (the 1-deep audio mix), as
+; pipe_sim.py wants it: the setup, then 64 samples of 4 voices each.
+; The memory classes matter: the envelope comes from MAIN RAM (ext),
+; the wavetable from the DSP's own local RAM (local) and the publish goes
+; to the DAC's I/O registers (io).
+;
+;   cd test/microbench
+;   lyxass -D BASE=$F1B000 -D CTRL=$00F1A114 -o x.o benchdspmix_naive.s
+;   tail -c +13 x.o > x.bin
+;   python3 test/tools/pipe_sim.py x.bin dsp \
+;       test/tools/pipe_sim/dsp_mix_naive.txt
+
+; The 68K builds the envelopes in main RAM (one DRAM page per voice,
+; the volume = the voice number) and the wavetable in the DSP's local
+; RAM (one longword per sample).
+mem ext 0x00020000 envelope 4
+mem local 0x00F1B400 counter 64
+
+0..8
+repeat 64:
+  9..14
+  repeat 4:
+    15..15  ext      # the voice's envelope (MAIN RAM)
+    16..16
+    17..17  local    # the wavetable (DSP local RAM)
+    18..30
+  32..32
+  33..33  io        # LTXD
+  34..34
+  35..35  io        # RTXD
+  36..40
+42..43
+44..46
+47..49  io         # the park: DSPGO = 0
