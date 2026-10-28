@@ -565,6 +565,27 @@ each one's expected stall profile.
 
 ---
 
+## Reading the RISC register file (host-only)
+
+`test/tools/risc_regdump.sh` prints the GPU or DSP register file as a
+4-per-row hex grid, in the style of a ChibiAkumas debugger screenshot.
+It runs the existing harness under host gdb, stops at `harness_shutdown`,
+and reads the `TEST_EXPORTS=1` getters (`GPUGetReg`/`GPUGetPC`/
+`GPUGetFlags`/`GPUGetControl`, or the DSP equivalents) — no core change
+and no extra build:
+
+```bash
+test/tools/risc_regdump.sh                  # GPU, particle ROM
+test/tools/risc_regdump.sh --map particle   # + register roles
+test/tools/risc_regdump.sh --dsp            # DSP, benchdsp_mix
+```
+
+The dump is the state at halt, not a trace.  It is deliberately not part
+of `make test`: it needs gdb, which the devbox image does not ship.  Run
+it on the host against a tree already built with `TEST_EXPORTS=1`.  The
+particle ROM's `r14`/`r15`/`r17` snapshot is a useful sanity check that
+the cursor and counter landed where the schedule model says they should.
+
 ## Assembling: what actually worked
 
 ```bash
