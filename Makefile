@@ -2884,6 +2884,31 @@ test/tools/test_hook_gate: test/tools/test_hook_gate.c \
 		test/harness/harness.c \
 		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
 
+# Demo-ROM tools: the particle-explosion demo, the 68K-only I2S square
+# wave, and the 68000 ALU conformance probe.  Each boots its committed
+# .j64 from test/microbench/ and asserts what the ROM achieved.
+test/tools/test_demo_particles: test/tools/test_demo_particles.c \
+		test/harness/harness.c test/harness/harness.h \
+		test/harness/trace_probe.c test/harness/trace_probe.h
+	$(CC) -O2 -Wall -std=c99 $(INCFLAGS) \
+		-o $@ test/tools/test_demo_particles.c \
+		test/harness/harness.c test/harness/trace_probe.c \
+		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
+
+test/tools/test_demo_audio: test/tools/test_demo_audio.c \
+		test/harness/harness.c test/harness/harness.h
+	$(CC) -O2 -Wall -std=c99 $(INCFLAGS) \
+		-o $@ test/tools/test_demo_audio.c \
+		test/harness/harness.c \
+		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
+
+test/tools/test_demo_alu: test/tools/test_demo_alu.c \
+		test/harness/harness.c test/harness/harness.h
+	$(CC) -O2 -Wall -std=c99 $(INCFLAGS) \
+		-o $@ test/tools/test_demo_alu.c \
+		test/harness/harness.c \
+		$(if $(filter Linux,$(shell uname -s)),-ldl) -lm
+
 # Purpose-built microbenchmark ROM assertions (#536).  Each tool boots its
 # committed .j64 from test/microbench/ and asserts the exercised engine
 # reached its fixed iteration count, reporting the frame it finished on.
@@ -3614,6 +3639,23 @@ microbench:
 		echo "==> $$t $$rom"; \
 		./$$t ./$(TARGET) "$$rom"; \
 	done
+
+# `make demos` -- run the three demo-ROM tools: the particle explosion
+# (the video path end to end), the 68K-only I2S square wave (the audio
+# path end to end), and the 68000 ALU conformance probe (the assembler's
+# register-register forms against the 68000's documented answers).
+.PHONY: demos
+demos: export VJ_EXPECT_BUILD := $(shell ./scripts/build-id.sh)
+demos:
+	$(MAKE) TEST_EXPORTS=1 -j$(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+	$(MAKE) TEST_EXPORTS=1 test/tools/test_demo_particles \
+		test/tools/test_demo_audio test/tools/test_demo_alu
+	./test/tools/test_demo_particles ./$(TARGET) \
+		test/microbench/benchdemo_particles.j64
+	./test/tools/test_demo_audio ./$(TARGET) \
+		test/microbench/benchdemo_audio.j64
+	./test/tools/test_demo_alu ./$(TARGET) \
+		test/microbench/benchdemo_alu.j64
 
 # `make particle-verify` -- the full proof for the GPU particle-transform
 # pair (benchgpu_particle.j64 vs benchgpu_particle_naive.j64):
