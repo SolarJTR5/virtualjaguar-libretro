@@ -37,10 +37,25 @@
 ;     longword store would pad every pixel to four bytes and the OP
 ;     would read the padding as pixels.
 ;
-;   * Each particle is a 2x2 block.  Per frame the demo erases the old
-;     position (black) and draws the new one (the particle's colour), so
-;     it never has to clear the whole 153 KB framebuffer -- which the
-;     68000 could not do in a 60 Hz frame anyway.
+; DOUBLE BUFFERING
+; ----------------
+;   The OP renders the framebuffer line by line as the beam sweeps, so
+;   a framebuffer that the 68000 rewrites while the OP reads it tears.
+;   Worse, a framebuffer that only ever gets the CURRENT particle
+;   positions erased keeps every older position as a trail, and after
+;   a few seconds the screen is a smear of the particle history.
+;
+;   So the demo keeps TWO framebuffers:
+;
+;     * the OP renders the FRONT buffer,
+;     * the 68000 draws the next frame into the BACK buffer,
+;
+;   and the buffers are swapped every field.  The back buffer holds the
+;   drawing from TWO fields ago (the front one was drawn in between), so
+;   a small "shadow" table per buffer -- the positions that buffer
+;   holds -- says exactly which pixels have to be erased before it is
+;   reused.  Nothing else is ever written to a framebuffer, so the
+;   erase is complete and no trail survives.
 ;
 ; THE SIMULATION
 ; --------------
@@ -51,7 +66,10 @@
 ;   * The explosion: every particle starts at the screen centre with a
 ;     pseudo-random direction and speed, so the burst spreads out
 ;     instead of moving as a block.
-;   * Gravity pulls y down; particles bounce off the walls.
+;   * The particles BOUNCE off the screen edges.  A decaying burst
+;     stops moving after a second or two and the demo turns into the
+;     static field this demo was written to avoid; bouncing keeps every
+;     particle in motion for as long as the ROM is left running.
 ;   * Colour: the hue advances every frame, so the burst cycles through
 ;     the palette instead of being a static colour field.
 ;
@@ -61,22 +79,33 @@
 ;   $010008  COUNT       frames simulated
 ;   $01000C  SPARE       reserved
 ;   $010010  PARTICLES   how many particles are alive
+;   $010014  BUFFER      0 = the front buffer is A, 1 = it is B
 ;
-; ASSEMBLER NOTES (rmac, learned the hard way -- see README.md)
+; ASSEMBLER NOTES (rmac, verified against the pinned build -- see
+; README.md and docs/agent/upstream-issue-drafts.md)
 ;   * Only d0-d7 and a0-a7 exist; d8+ are "undefined expression".
-;   * MOVEQ is data-register only.
-;   * Shift immediates are 1..8, so anything bigger is a loop.
-;   * MULU has no register-register form.
-;   * ADDQ's immediate is 1..8.
-;   * A MOVE with a register SOURCE and an absolute-long DESTINATION is
-;     assembled backwards (move.l d0,$00110000 becomes
-;     move.l #$00110000,d0) -- use an address register instead:
-;     move.l #ADDR,a3 ; move.l d0,(a3).
-;   * LEA and MOVE with a DISPLACEMENT (2(a1)) are mis-assembled: LEA
-;     swallows the following bytes as an absolute address, and a store
-;     with a displacement becomes PC-relative.  There is no working
-;     displacement form at all, so this ROM addresses everything through
-;     pointer registers and ADD.L #n,An.
+;   * MOVEQ is data-register only, and its immediate is 0..255.
+;   * Shift immediates are 1..8; a bigger shift needs the register form
+;     (moveq #27,d4 ; lsr.l d4,d2).
+;   * ADDQ's immediate is 1..8; anything bigger needs ADD.L #n,An.
+;   * MULU has no register-register LONG form on the 68000 (rmac
+;     rejects it: "unsupported for selected CPU"), and MULU with an
+;     IMMEDIATE source is not a 68000 instruction at all -- rmac
+;     assembles `mulu.w #$6A0D,d2` as MOVE.B #$6A0D,(A2)+, which
+;     silently corrupts the table and the pointer.  Use MULU.W with a
+;     register source only.
+;   * A label in an INDEXED form (`TBL(a0)`) is assembled as a
+;     section-relative displacement, not as an absolute address, so
+;     indexed accesses to labels are wrong.  A plain displacement
+;     (`4(a0)`) is fine.
+;   * The index SCALE of a register+register form (`d(a1,a0)`) is always
+;     byte, whatever the access width, so the effective address is
+;     wrong for word and long accesses.
+;   * Forward branches DO assemble (rmac sizes the displacement itself);
+;     the only quirk is that a branch to the immediately following
+;     instruction comes out as a NOP, which is the same behaviour.
+;   * DBRA runs the body N+1 times for a counter of N (it branches
+;     until the counter is -1), so "N iterations" means "counter = N-1".
 ;
 ; Build (from this directory, toolchain on PATH):
 ;   eval "$(tools/jaguar-toolchain/setup.sh env)"
@@ -104,17 +133,35 @@ VMODE_VAL      .equ    $07C1         ; bit 8 (VARMOD) = the per-pixel
         VDB_VAL        .equ    38
         VDE_VAL        .equ    518
 
-FB_BASE        .equ    $00030000          ; 320x240x16bpp = 153600 bytes
-        LIST_BASE      .equ    $00020000
-        LIST_BASE_LO   .equ    (LIST_BASE&$FFFF)
-        LIST_BASE_HI   .equ    ((LIST_BASE>>16)&$FFFF)
+; --- the two framebuffers -------------------------------------------
+; 320 x 240 pixels x 2 bytes = 153600 bytes each.
+FB_A           .equ    $00030000
+FB_B           .equ    $00058000
+BACKPTR        .equ    $00010018      ; the buffer being drawn into
+SHADOWPTR      .equ    $0001001C      ; its shadow table (x,y per particle)
+BUFFLAG        .equ    $00010014      ; 0 = the front buffer is A
+
+LIST_BASE      .equ    $00020000
+LIST_BASE_LO   .equ    (LIST_BASE&$FFFF)
+LIST_BASE_HI   .equ    ((LIST_BASE>>16)&$FFFF)
         BMP_OBJ        .equ    LIST_BASE+0
         STOP_OBJ       .equ    LIST_BASE+16
 
 ; --- particles -------------------------------------------------------
 PARTICLE_BASE  .equ    $00110000          ; 256 * 16 bytes = 4096
-        PARTICLE_COUNT .equ    256
-        PARTICLE_STRIDE .equ    16                ; x, y, vx, vy (LONGs)
+; The number of particles is a BUDGET, not a taste: the OP renders a
+; full-screen bitmap every field, and the 68000's framebuffer writes
+; share that DRAM bus.  A 16bpp DRAM write costs the 68000 a couple of
+; hundred cycles here, so 64 particles x (2 erase + 2 draw + 1 shadow)
+; = 320 writes is about 6 ms -- comfortably inside one 16.6 ms field.
+; Draw more than that and the drawing overruns the field: the object
+; cannot be re-armed in time, its remaining height runs out, and the
+; screen decays to black.
+PARTICLE_COUNT .equ    64
+PARTICLE_STRIDE .equ    16                ; x, y, vx, vy (LONGs)
+SHADOW_A       .equ    $00111000          ; 256 * 4 bytes: (y << 16) | x
+SHADOW_B       .equ    $00111800
+PALETTE        .equ    $00112000          ; 64 colour words (RGB555)
 
 ; --- object list fields ---------------------------------------------
 ; p0: type=0 (BITMAP), ypos=0, height=240, link=STOP_OBJ, data=FB_BASE
@@ -126,45 +173,69 @@ PARTICLE_BASE  .equ    $00110000          ; 256 * 16 bytes = 4096
 ;            encode link $010010 -- the sentinel block -- and the screen
 ;            would stay black.)
 ;   height = 240 << 14 = $003C0000.
-        BMP_P0_HI      .equ    $03000040
+; The high longword also carries the link bit, so there is one variant
+; per framebuffer: data $03000000 for A, $05800000 for B.
+        BMP_P0_HI_A    .equ    $03000040
+        BMP_P0_HI_B    .equ    $05800040
         BMP_P0_LO      .equ    $023C0000
 
 ; p1: xpos=0, depth=4 (16bpp), pitch=1 phrase (8 bytes), dwidth=640
 ;     bytes/line (80 << 18), iwidth=80 phrases (320 px).
         BMP_P1_HI      .equ    $00000005          ; iwidth 80 spills into the high word
-        BMP_P1_LO      .equ    $0140C000
+        BMP_P1_LO      .equ    $140C000
 
         STOP_P0_HI     .equ    $00000000
         STOP_P0_LO     .equ    $00000004
 
 ; --- physics ---------------------------------------------------------
-        ; The burst's upward drift DECAYS with the velocity: a constant -1 per
-; frame accumulated (the drag never touched it) and carried every particle
-; off the top of the screen within seconds -- the "then black" you saw
-; after the initial burst.  Zero keeps the burst where it is.
-DRIFT          .equ    0                  ; no constant drift: the burst settles
-        CENTER_X       .equ    SCR_W/2
-        CENTER_Y       .equ    SCR_H/2
+; The burst: every particle leaves the centre with a pseudo-random
+; direction and a speed of up to 16 pixels per frame.  The particles
+; bounce off the edges of the screen, so they never leave it and never
+; stop moving.
+;
+; The random numbers come from a Weyl sequence (seed += 0x9E3779B9):
+; the high bits of that sequence are the best distributed bits of any
+; cheap 32-bit counter, and the velocity is taken from bits 27-31 and
+; 22-26, which gives all 256 different (vx,vy) pairs.
+;
+; The velocities used to come out of the TOP TWO BITS of a 32-bit
+; multiplicative LCG, whose period is 4 -- every particle got nearly the
+; same velocity and the "explosion" was a blob drifting up and to the
+; left.
+VEL_SHIFT_X   .equ    27
+VEL_SHIFT_Y   .equ    22
+VEL_MASK      .equ    $001F               ; 5 bits -> -16..15
+VEL_BIAS      .equ    16
+WELLY_STEP    .equ    $9E3779B9           ; 2^32 / golden ratio
+CENTER_X       .equ    SCR_W/2
+CENTER_Y       .equ    SCR_H/2
+
+; The 2x2 block has to stay inside the 320x240 framebuffer.
+MAX_X         .equ    SCR_W-2
+MAX_Y         .equ    SCR_H-2
 
 ; --- sentinels -------------------------------------------------------
         MB_SENT_PART   .equ    MB_SENT_BASE+16
-                
+
 ; --- register use ----------------------------------------------------
 ; a0  framebuffer pointer
-; a1  particle table: x
+; a1  particle table: x        (or the shadow table in the erase pass)
 ; a2  particle table: y
 ; a3  particle table: vx
 ; a4  particle table: vy
-; a5  scratch address
-; a6  scratch address
+; a5  shadow table: x, y
+; a6  scratch
 ; d0  scratch
-; d1  loop counter
-; d2  particle index
-; d3  frame number
-; d4  x
-; d5  y
-; d6  vx
-; d7  vy
+; d1  loop counter            (LIVE across the subroutines)
+; d2  particle index          (LIVE across the subroutines)
+; d3  frame number            (LIVE across the subroutines)
+; d4  x                       (an INPUT to the subroutines)
+; d5  y                       (an INPUT to the subroutines)
+; d6  vx -> the colour word   (after the state has been stored)
+; d7  vy -> colour scratch    (after the state has been stored)
+;
+; The subroutines (erase_block, draw_block, fb_addr) may clobber d0 and
+; a0 and nothing else.
 
 start:
         ; Supervisor mode, interrupts masked.
@@ -181,8 +252,8 @@ start:
         ; Set up the stack explicitly.  This core's cart HLE path writes
         ; the SSP into RAM[0] but never gives the 68000 a stack pointer,
         ; so A7 starts at 0: the first jsr pushes its return address at
-        ; $FFFFFFFC (discarded) and the rts returns to whatever is in the
-        ; stack slot -- garbage.  The demo uses jsr/rts, so it must set
+        ; $FFFFFFFC (discarded) and the rts returns to whatever is in
+        ; the stack slot -- garbage.  The demo uses jsr/rts, so it must set
         ; A7 itself.  (The microbenchmark ROMs never call a subroutine,
         ; which is why they never noticed.)
         move.l  #$00003FF0,a7
@@ -194,7 +265,7 @@ start:
         move.w  #VDE_VAL,TOM_VDE
 
 ; ---- 2. build the object list ---------------------------------------
-        move.l  #BMP_P0_HI,BMP_OBJ
+        move.l  #BMP_P0_HI_A,BMP_OBJ
         move.l  #BMP_P0_LO,BMP_OBJ+4
         move.l  #BMP_P1_HI,BMP_OBJ+8
         move.l  #BMP_P1_LO,BMP_OBJ+12
@@ -206,8 +277,9 @@ start:
         move.w  #LIST_BASE_HI,TOM_OLP_HI
 
 ; ---- 4. seed the particles ------------------------------------------
-; Deterministic pseudo-random sequence (a 32-bit LCG), so the explosion
-; is the same on every run and two frames can be compared directly.
+; Deterministic pseudo-random sequence (a Weyl sequence), so the
+; explosion is the same on every run and two frames can be compared
+; directly.
 ;
 ; Each particle: start at the centre, leave in a pseudo-random
 ; direction with a pseudo-random speed.
@@ -227,39 +299,24 @@ seedloop:
         move.l  #CENTER_Y,a5
         move.l  a5,(a2)
 
-        ; vx: a pseudo-random value in -3..3
+        ; vx: bits 27-31 of the seed, minus 16 -> -16..15
         move.l  d0,d2
-        moveq   #29,d3
-seed_shr29:
-        lsr.l   #1,d2
-        dbra    d3,seed_shr29            ; 29 shifts -> seed >> 29
-        andi.l  #$000F,d2               ; the speed: -8..7 (the drag is
-        sub.l   #8,d2                   ; 15/16, so this spreads ~128 px)
+        moveq   #VEL_SHIFT_X,d4
+        lsr.l   d4,d2
+        andi.l  #VEL_MASK,d2
+        sub.l   #VEL_BIAS,d2
         move.l  d2,(a3)
 
-        ; vy: a pseudo-random value in -6..-1 (the burst goes UP first)
+        ; vy: bits 22-26 of the seed, minus 16 -> -16..15
         move.l  d0,d2
-        moveq   #26,d3
-seed_shr26:
-        lsr.l   #1,d2
-        dbra    d3,seed_shr26            ; 26 shifts -> seed >> 26
-        andi.l  #$000F,d2               ; the speed: -8..7
-        sub.l   #8,d2
+        moveq   #VEL_SHIFT_Y,d4
+        lsr.l   d4,d2
+        andi.l  #VEL_MASK,d2
+        sub.l   #VEL_BIAS,d2
         move.l  d2,(a4)
 
-        ; next seed: seed = seed*1664525 + 1013904223, computed with the
-        ; 68000's MULU (source-only) on the halves.
-        move.l  d0,d2
-        mulu.w  #$6A0D,d2                ; low16(seed) * 0x6A0D
-        move.l  d0,d3
-        moveq   #16,d4
-seed_shl:
-        lsr.l   #1,d3
-        dbra    d4,seed_shl              ; d3 = seed >> 16
-        mulu.w  #$0019,d3                ; (seed>>16) * 0x19
-        add.l   d2,d3
-        move.l  d3,d0
-        addi.l  #$3C6EF35F,d0
+        ; next seed: seed += 0x9E3779B9 (the golden-ratio step)
+        addi.l  #WELLY_STEP,d0
 
         ; advance the four pointers by the stride
         add.l   #PARTICLE_STRIDE,a1
@@ -268,16 +325,71 @@ seed_shl:
         add.l   #PARTICLE_STRIDE,a4
         dbra    d1,seedloop
 
+        ; the shadow tables start out empty: the first frames erase
+        ; nothing and the buffers are already clear.
+        move.l  #0,d0
+        move.l  #SHADOW_A,a6
+        move.w  #(PARTICLE_COUNT-1),d1
+shclr:
+        move.l  d0,(a6)
+        addq.l  #4,a6
+        dbra    d1,shclr
+        move.l  #SHADOW_B,a6
+        move.w  #(PARTICLE_COUNT-1),d1
+shclr2:
+        move.l  d0,(a6)
+        addq.l  #4,a6
+        dbra    d1,shclr2
 
-; ---- 5. clear the framebuffer ---------------------------------------
-        move.l  #FB_BASE,a0
+
+; ---- 4b. build the colour palette -----------------------------------
+; 64 random RGB555 words.  Computing the colour per particle per frame
+; cost ~20 instructions each, which is a quarter of the whole drawing
+; budget; a table lookup is one read.  The particle's palette index is
+; (particle + frame) & 63, so the hue still rotates every frame.
+        move.l  #$0000C0DE,d0
+        move.l  #PALETTE,a5
+        move.w  #63,d1
+palbuild:
+        addi.l  #WELLY_STEP,d0          ; the next seed
+        move.l  d0,d2                   ; red = ((seed >> 16) & 0x1F) << 11
+        moveq   #16,d4
+        lsr.l   d4,d2
+        andi.l  #$001F,d2
+        lsl.l   #3,d2
+        lsl.l   #8,d2
+        move.l  d0,d3                   ; green = (seed >> 8) & 0x3F
+        moveq   #8,d4
+        lsr.l   d4,d3
+        andi.l  #$003F,d3
+        or.l    d3,d2
+        move.l  d0,d3                   ; blue = ((seed >> 3) & 0x1F) << 6
+        moveq   #3,d4
+        lsr.l   d4,d3
+        andi.l  #$001F,d3
+        lsl.l   #6,d3
+        or.l    d3,d2
+        ori.l   #$0001,d2                ; bit0 = "this pixel is RGB, not CRY"
+        move.l  d2,(a5)
+        addq.l  #4,a5
+        dbra    d1,palbuild
+
+
+; ---- 5. clear both framebuffers -------------------------------------
+; The clear writes ZEROS: storing an incrementing counter here (which is
+; what this loop used to do) paints a gradient over the screen instead
+; of clearing it.
         move.w  #0,d0
-        move.w  #(SCR_H*SCR_W/8)-1,d1     ; 9600 longword stores = 76800 words
-        move.l  #0,d3
-fbclr:
-        move.l  d3,(a0)+
-        addq.l  #1,d3
-        dbra    d1,fbclr
+        move.w  #((SCR_H*SCR_W)/2)-1,d1  ; 38400 longword stores
+        move.l  #FB_A,a0
+fbclrA:
+        move.l  d0,(a0)+
+        dbra    d1,fbclrA
+        move.w  #((SCR_H*SCR_W)/2)-1,d1
+        move.l  #FB_B,a0
+fbclrB:
+        move.l  d0,(a0)+
+        dbra    d1,fbclrB
 
 
 ; ---- 6. run ----------------------------------------------------------
@@ -287,36 +399,75 @@ fbclr:
         moveq   #0,d3                     ; frame counter
 
 frameloop:
-        ; ---- wait until the beam is inside the visible window ...
-waitup:
-        move.w  TOM_VC,d0
-        andi.w  #$07FF,d0
-        cmpi.w  #VDB_VAL,d0
-        blt.w   waitup
-
-        ; ---- ... then until the field wraps back to the top.  Only there
-        ;      is the OP idle (its first pass of the next field is at
-        ;      VDB), and only then may the object be re-armed -- ONCE.
-        ;      Re-arming on every poll inside the blanking window (38
-        ;      times per field) races the OP's write-back and exhausts
-        ;      the object: a black screen.
+        ; ---- wait for the TOP of the field.  The OP only renders the
+        ;      visible window (VC from VDB to VDE), so the blanking above
+        ;      VDB is the one place where the OP cannot be mid-object --
+        ;      and the object has to be re-armed there, exactly once.
+        ;
+        ;      Waiting for "VC > VDE" instead is a LEVEL test: it stays
+        ;      true for the rest of the field, and the 68K polls it in a
+        ;      tight loop, so the object gets re-armed hundreds of times
+        ;      per field.  Each re-arm is two longword stores (DATA, then
+        ;      HEIGHT/LINK), and if the OP reads the object between them
+        ;      it sees a FRESH DATA with an EXHAUSTED HEIGHT, skips the
+        ;      object, and the line comes out black.
+        ;
+        ;      VC ($F00006) is updated by the core on every halfline;
+        ;      bit 11 ($0800) marks the lower field, so it has to be
+        ;      masked off before the comparison.
 waitdn:
         move.w  TOM_VC,d0
         andi.w  #$07FF,d0
         cmpi.w  #VDB_VAL,d0
         bge.w   waitdn
-
-        ; ---- re-arm the OP object (safe: the OP is not running here)
-        move.l  #BMP_P0_HI,BMP_OBJ
+        ; ---- pick the buffers.  The OP renders the FRONT buffer; the
+        ;      68000 draws the next frame into the BACK one.
+        move.l  #BUFFLAG,a0
+        move.l  (a0),d0
+        tst.l   d0
+        beq.w   front_is_a
+        ; the front is B, so the back is A
+        move.l  #BMP_P0_HI_B,BMP_OBJ
+        move.l  #FB_A,d1
+        move.l  d1,BACKPTR
+        move.l  #SHADOW_A,d1
+        move.l  d1,SHADOWPTR
+        bra.w   buffers_set
+front_is_a:
+        move.l  #BMP_P0_HI_A,BMP_OBJ
+        move.l  #FB_B,d1
+        move.l  d1,BACKPTR
+        move.l  #SHADOW_B,d1
+        move.l  d1,SHADOWPTR
+buffers_set:
         move.l  #BMP_P0_LO,BMP_OBJ+4
         move.w  #LIST_BASE_LO,TOM_OLP_LO
         move.w  #LIST_BASE_HI,TOM_OLP_HI
 
-        ; ---- simulate and draw one frame ------------------------------
+        ; ---- pass 1: erase what the back buffer holds ---------------
+        ;     The shadow table holds exactly the positions that buffer
+        ;     was drawn with, so erasing them clears it completely.
+        move.l  #SHADOWPTR,a0
+        move.l  (a0),a1                ; the shadow table's base
+        move.w  #(PARTICLE_COUNT-1),d1
+erasepass:
+        move.l  (a1),d0                 ; the packed position
+        move.l  d0,d4
+        andi.l  #$FFFF,d4                ; x
+        moveq   #16,d6
+        lsr.l   d6,d0                    ; y
+        move.l  d0,d5
+        jsr     erase_block
+        addq.l  #4,a1
+        dbra    d1,erasepass
+
+        ; ---- pass 2: advance every particle and draw it ---------------
         move.l  #PARTICLE_BASE,a1
         move.l  #PARTICLE_BASE+4,a2
         move.l  #PARTICLE_BASE+8,a3
         move.l  #PARTICLE_BASE+12,a4
+        move.l  #SHADOWPTR,a0
+        move.l  (a0),a5                ; the shadow table's base
         move.w  #(PARTICLE_COUNT-1),d1
         moveq   #0,d2                     ; particle index
 particleloop:
@@ -326,35 +477,74 @@ particleloop:
         move.l  (a3),d6                 ; vx
         move.l  (a4),d7                 ; vy
 
-        ; --- erase the old position (2x2 block, black)
-        jsr     erase_block
-
-        ; --- advance.  The subroutines use d4/d5 as scratch, so x and y
-        ; are re-read from the table (the table is the state).
-        move.l  (a1),d4                  ; x
-        move.l  (a2),d5                  ; y
-        ; The burst DECELERATES (drag) instead of bouncing:
-        ;     the velocities shrink by 1/8 every frame, so the whole
-        ;     excursion stays well inside the screen and no bounds test
-        ;     (a conditional) is needed at all.  This toolchain cannot
-        ;     resolve a forward branch reference -- rmac defers it to the
-        ;     linker and rln cannot patch an 8-bit displacement -- so
-        ;     every conditional in this ROM is written as a backward loop.
+        ; --- advance
         add.l   d6,d4                    ; x += vx
         add.l   d7,d5                    ; y += vy
-        move.l  d6,d0
-        asr.l   #4,d0
-        sub.l   d0,d6                    ; drag: vx -= vx/16 (15/16 left)
-        move.l  d7,d0
-        asr.l   #4,d0
-        sub.l   d0,d7                    ; drag: vy -= vy/16
-        addi.l  #DRIFT,d7                ; a little upward drift
+
+        ; --- bounce off the edges.  The 2x2 block has to stay inside the
+        ;     framebuffer, so the particle is reflected at 0 and at
+        ;     MAX_X/MAX_Y.  Reflecting (rather than clamping) keeps the
+        ;     speed, so the burst never settles.
+        cmpi.w  #0,d4
+        blt.w   px_low
+        cmpi.w  #MAX_X,d4
+        bgt.w   px_high
+        bra.w   px_done
+px_low:
+        neg.l   d4
+        neg.l   d6
+        bra.w   px_done
+px_high:
+        move.l  #MAX_X,d4
+        neg.l   d6
+px_done:
+        cmpi.w  #0,d5
+        blt.w   py_low
+        cmpi.w  #MAX_Y,d5
+        bgt.w   py_high
+        bra.w   py_done
+py_low:
+        neg.l   d5
+        neg.l   d7
+        bra.w   py_done
+py_high:
+        move.l  #MAX_Y,d5
+        neg.l   d7
+py_done:
 
         ; --- store the new state
         move.l  d4,(a1)
         move.l  d5,(a2)
         move.l  d6,(a3)
         move.l  d7,(a4)
+
+        ; --- remember where this buffer now holds the particle: the
+        ;     position is packed into one longword, (y << 16) | x, so
+        ;     that the erase pass needs a single read per particle
+        move.l  d5,d0
+        moveq   #16,d6
+        lsl.l   d6,d0
+        or.l    d4,d0
+        move.l  d0,(a5)
+        addq.l  #4,a5
+
+        ; --- the colour: one lookup in the palette, indexed by
+        ;     (index + frame) so the hue rotates every frame.
+        ;
+        ;     The OP fetches the framebuffer's pixels BIG-ENDIAN (the
+        ;     same order the 68000's word stores use -- see the phrase
+        ;     fetch in src/tom/op.c), so the word is stored exactly as
+        ;     the core's MIX16 table wants it: R in bits 15-11, B in
+        ;     bits 10-6, G in bits 5-0, and bit 0 selecting RGB16
+        ;     instead of CRY.  (Byte-swapping it -- as this demo used to
+        ;     do -- throws the green away and lands in CRY mode.)
+        move.l  d2,d0
+        add.l   d3,d0                    ; colour phase = index + frame
+        andi.l  #$003F,d0
+        lsl.l   #2,d0
+        move.l  #PALETTE,a0
+        add.l   a0,d0
+        move.l  (a0),d6                 ; the colour word
 
         ; --- draw the new position in the particle's colour
         jsr     draw_block
@@ -367,12 +557,13 @@ particleloop:
         addq.w  #1,d2
         dbra    d1,particleloop
 
-        ; ---- the frame is drawn; wait for the field to end -----------
-waitout:
-        move.w  TOM_VC,d0
-        andi.w  #$07FF,d0
-        cmpi.w   #VDE_VAL,d0
-        bhi.w   waitout
+        ; ---- the frame is drawn.  Swap the buffers and wait for the top
+        ;      of the next field, so the demo advances once per field
+        ;      (60 times a second).
+        move.l  #BUFFLAG,a0
+        move.l  (a0),d0
+        eori.l  #1,d0
+        move.l  d0,(a0)
 
         addq.w  #1,d3
         move.l  #MB_SENT_COUNT,a5
@@ -380,106 +571,61 @@ waitout:
         bra.w   frameloop
 
 ; ---------------------------------------------------------------------
-; erase_block -- write a black 2x2 block at (d4,d5).
+; erase_block -- write a black 2x2 block at (d4,d5) in the BACK buffer.
 ; ---------------------------------------------------------------------
 erase_block:
-        jsr     fb_addr                 ; a0 = FB_BASE + (y*320+x)*2
-        moveq   #0,d2
-        move.w  d2,(a0)
-        move.l  a0,a5
-        add.l   #2,a5
-        move.w  d2,(a5)
-        move.l  a0,a5
-        add.l   #640,a5                  ; the row below
-        move.w  d2,(a5)
-        move.l  a5,a6
-        add.l   #2,a6
-        move.w  d2,(a6)
+        jsr     fb_addr                 ; a0 = the pixel address
+        moveq   #0,d0
+        move.w  d0,(a0)
+        addq.l  #2,a0
+        move.w  d0,(a0)
+        subq.l  #2,a0
+        add.l   #640,a0                  ; the row below
+        move.w  d0,(a0)
+        addq.l  #2,a0
+        move.w  d0,(a0)
         rts
 
 ; ---------------------------------------------------------------------
-; draw_block -- write a coloured 2x2 block at (d4,d5).
-; The colour phase is d2 (particle index) + d3 (frame number).
+; draw_block -- write a coloured 2x2 block at (d4,d5) in the BACK buffer.
+; d6 holds the colour word (already byte-swapped).
 ; ---------------------------------------------------------------------
 draw_block:
-        ; colour: RGB555 with bit15 (RGB mode) and bit0 (RGB select).
-        ; The hue rotates with the phase.
-        ; d3 is the FRAME COUNTER and must survive this routine, so the
-        ; colour maths uses d6/d7 (the velocities, already stored back
-        ; into the particle table before the call).
-        move.l  d2,d0
-        add.l   d3,d0                    ; colour phase = index + frame
-        move.l  d0,d1
-        lsr.l   #8,d1
-        andi.l  #$1F,d1                  ; red
-        moveq   #3,d4
-cr_shl3:
-        lsl.l   #1,d1
-        dbra    d4,cr_shl3
-        moveq   #8,d4
-cr_shl8:
-        lsl.l   #1,d1
-        dbra    d4,cr_shl8               ; red -> bits 15..11
-        move.l  d0,d6
-        moveq   #13,d4
-cr_shr13:
-        lsr.l   #1,d6
-        dbra    d4,cr_shr13
-        andi.l  #$1F,d6                  ; blue -> bits 10..6
-        moveq   #4,d4
-cr_shl4:
-        lsl.l   #1,d6
-        dbra    d4,cr_shl4
-        or.l    d1,d6
-        move.l  d0,d7
-        andi.l  #$003F,d7                ; green -> bits 5..0
-        or.l    d7,d6
-        ori.l   #$0001,d6                ; bit0 = "this pixel is RGB, not CRY"
-        lsr.l   #8,d6                    ; byte-swap for the OP's fetches
-        move.l  d6,d7                    ; the colour word (memory order)
-
-        jsr     fb_addr                 ; a0 = FB_BASE + (y*320+x)*2
-        move.w  d7,(a0)
-        move.l  a0,a5
-        add.l   #2,a5
-        move.w  d7,(a5)
-        move.l  a0,a5
-        add.l   #640,a5                  ; the row below
-        move.w  d7,(a5)
-        move.l  a5,a6
-        add.l   #2,a6
-        move.w  d7,(a6)
+        jsr     fb_addr                 ; a0 = the pixel address
+        move.w  d6,(a0)
+        addq.l  #2,a0
+        move.w  d6,(a0)
+        subq.l  #2,a0
+        add.l   #640,a0                  ; the row below
+        move.w  d6,(a0)
+        addq.l  #2,a0
+        move.w  d6,(a0)
         rts
 
 ; ---------------------------------------------------------------------
-; fb_addr -- a0 = FB_BASE + (d1*320 + d0)*2, clipped to the screen.
+; fb_addr -- a0 = the back buffer + y*640 + x*2.
+;
+; d4 = x, d5 = y on entry.  Only d0 may be clobbered: d1/d2/d3 are live
+; in the caller and d4/d5 are the position the caller still needs.
+;
+; The address is built with shifts only (the 68000 has no MULU with a
+; register source and rmac cannot do a 32-bit multiply), and every
+; shift is unrolled because the assembler's immediate shift counts stop
+; at 8:
+;
+;     y*640 = (y*5) << 7
+;     x*2   = x + x
 ; ---------------------------------------------------------------------
 fb_addr:
-        ; d4 = x, d5 = y on entry; the pixel address comes back in a0.
-        ;
-        ; address = FB_BASE + y*640 + x*2, and y*640 = (y*5) << 7.
-        ; No MULU (the 68000 has no register-register form) and no shift
-        ; immediate over 8.
-        ;
-        ; REGISTER DISCIPLINE: d1 (the particle loop's DBRA counter),
-        ; d2 (the particle index), d3 (the frame counter) and d6/d7
-        ; (the velocities) are LIVE in the caller and must survive this
-        ; call -- clobbering d1 alone makes the particle loop run 65536
-        ; times and the burst flies off the screen.  So this routine
-        ; may only touch d0, d4 and d5.
         move.l  d5,d0
-        moveq   #2,d4
-fb_x4:
-        add.l   d0,d0                     ; d0 = y*4
-        dbra    d4,fb_x4
-        add.l   d5,d0                     ; d0 = y*5
-        moveq   #7,d4
-fb_x128:
-        lsl.l   #1,d0
-        dbra    d4,fb_x128                ; d0 = y*640
-        move.l  d4,d5
-        lsl.l   #1,d5                     ; d5 = x*2
-        add.l   d5,d0
-        add.l   #FB_BASE,d0
+        lsl.l   #1,d0                    ; y*2
+        lsl.l   #1,d0                    ; y*4
+        add.l   d5,d0                    ; y*5
+        lsl.l   #7,d0                    ; y*640
+        add.l   d4,d0                    ; + x
+        add.l   d4,d0                    ; + x  ->  y*640 + 2*x
+        move.l  #BACKPTR,a0
+        move.l  (a0),a0                  ; the back buffer's base
+        add.l   a0,d0
         move.l  d0,a0
         rts

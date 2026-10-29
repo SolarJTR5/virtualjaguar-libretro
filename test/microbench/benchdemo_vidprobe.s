@@ -49,7 +49,7 @@ TOM_VDE        .equ    $00F00048
 ; programs them leaves tomWidth at 0, and the scanline renderers write
 ; zero pixels per row -- a completely black screen even though the OP
 ; filled the line buffer correctly.
-VMODE_VAL      .equ    $07C1         ; bit 8 (VARMOD) = the per-pixel
+VMODE_VAL      .equ    $0741         ; bit 8 (VARMOD) = the per-pixel
                                         ; CRY/RGB16 renderer.  WITHOUT it
                                         ; the core uses the CRY renderer
                                         ; and looks every pixel up in
@@ -103,7 +103,7 @@ BMP_P0_LO      .equ    $023C0000
 ;   pitch field: (p1 >> 15) & 7 -> 1, then <<3 = 8 bytes per phrase.
 ;   depth field: (p1 >> 12) & 7 -> 4 = 16bpp.
 BMP_P1_HI      .equ    $00000005
-BMP_P1_LO      .equ    $0140C000
+BMP_P1_LO      .equ    $140C000
 
 ; STOP object: type 4, no IRQ.
 STOP_P0_HI     .equ    $00000000
@@ -187,7 +187,8 @@ xl:
         lsl.w   #8,d5                 ;  a 68000 shift immediate is 1..8)
         lsl.w   #5,d6                 ; green -> bits 10..5
         or.w    d5,d6
-        or.w    #$0180,d6             ; byte-swapped: bit15 = RGB mode, bit0 = RGB select
+        or.w    #$0001,d6             ; bit0 = "RGB, not CRY" (the core's
+                                      ;   MIX16 table selects on bit 0)
         move.w  d6,(a0)+
         addq.w  #1,d4
         dbra    d3,xl

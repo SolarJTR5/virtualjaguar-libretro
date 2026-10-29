@@ -43,7 +43,7 @@ BMP_P0_HI      .equ    $03000040
 BMP_P0_LO      .equ    $023C0000
 ; p1: xpos=0, depth=4 (16bpp), pitch=1 phrase, dwidth=640, iwidth=80
 BMP_P1_HI      .equ    $00000005
-BMP_P1_LO      .equ    $0140C000
+BMP_P1_LO      .equ    $140C000
 STOP_P0_HI     .equ    $00000000
 STOP_P0_LO     .equ    $00000004
 

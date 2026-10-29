@@ -677,43 +677,61 @@ the cursor and counter landed where the schedule model says they should.
 
 ## Assembling: what actually worked
 
-> **The toolchain cannot resolve a forward branch reference.** rmac
-> defers a branch to a label defined *later* in the file to the linker,
-> and rln can only patch a 16-bit displacement — an 8-bit short branch
-> that needs patching makes `rln` fail outright.  So **every branch in
-> an rmac-assembled ROM must target a label defined EARLIER in the
-> file**.  The five benchmark ROMs above only ever branch backwards, so
-> this never showed up; the demo ROMs hit it immediately (a `bhi.s` to a
-> forward label produced a garbage displacement and the ROM ran off into
-> the particle table).
+> **Check the assembler you are using before you trust it.** The toolchain
+> is vendored *outside* this repository (`tools/vendor/jaguar-toolchain/`,
+> gitignored, fetched by `tools/jaguar-toolchain/setup.sh`), so it is not
+> under this repo's control — and it can be wrong in ways that nothing
+> reports.  A local, uncommitted edit to rmac's machine table
+> (`68k.mch`) once changed the AND opcode from `$C` to `$B`, so every
+> `and.l Dn,Dm` assembled as `cmp.l Dn,Dm`: a silent, well-formed,
+> completely wrong instruction, and every "the assembler is broken"
+> conclusion drawn from it was wrong.
 >
-> The way to write a conditional without a forward branch is a **backward
-> loop whose body comes first**: the body is unconditional, the backward
-> branch repeats it while the condition holds, and the fall-through is
-> the "done" case.  The demo ROMs use that shape everywhere.
+> Before trusting an assembler result:
 >
-> Other rmac limits worth knowing (all confirmed against the pinned
-> upstream SHA `50e66ea`, so they are not local damage):
+> ```bash
+> git -C tools/vendor/jaguar-toolchain/rmac status --short   # must be empty
+> git -C tools/vendor/jaguar-toolchain/rmac diff              # must be empty
+> ```
 >
-> * `cmp #imm,Dn` assembles as a **branch** — the 68000's compare-with-
->   immediate is the separate `CMPI` instruction, so write `cmpi.w` /
->   `cmpi.l`.  A `cmp` with an immediate silently becomes an invalid
->   instruction.
-> * `move.l Dn,<absolute>` is assembled **backwards** (it becomes
->   `move.l #imm,Dn`).  Use `move.l #ADDR,aN` + `move.l Dn,(aN)`.
-> * `lea disp(An),Am` swallows the following bytes as an absolute
->   address.  There is no working displacement form at all: address
->   everything through pointer registers and `add.l #n,An`.
-> * `move.l Dn,(An)+` and friends do not use the textbook bit layout,
->   but they do it *consistently*: the committed ROMs are built with the
->   same encoding and behave correctly, so trust the assembler here and
->   read the object file if you need to know what a byte means.
+> and rebuild it from scratch (`make clean && make`) so no stale object
+> file from an earlier experiment survives.  `test/microbench/benchdemo_alu.s`
+> plus `test/tools/test_demo_alu.c` exist for exactly this: they run 16
+> register-register ALU forms and compare the results against the 68000's
+> documented answers, so a mis-assembled mnemonic fails a test instead of
+> quietly changing the demo.
+>
+> rmac's real limits, all re-verified against the pinned upstream SHA
+> `50e66ea` built from a pristine checkout:
+>
+> * **A label in an indexed form is mis-assembled.** `move.w TBL(a0),d1`
+>   comes out as `MOVE.W (d16,A0),D1` with the *section-relative*
+>   offset of `TBL` in the extension word, so the effective address is
+>   short by the section base and the read lands in the wrong place.
+>   `move.l #TBL,aN` + `move.w (aN),Dn` is the way to write it.
+> * **The index scale of `d(An,Am)` is always "byte"**, whatever the
+>   access width, so a word or long access through two registers reads
+>   the wrong address.  Use one register plus an explicit add.
+> * `cmp #imm,Dn` is encoded as a CMP with an *immediate* effective
+>   address (`B0 7C ..`), which the 68000 does not have — write
+>   `cmpi.w` / `cmpi.l`.
+> * `mulu.w #$imm,Dn` is likewise an immediate-EA form (`C4FC` + the
+>   immediate, i.e. `MOVE.L #imm,(A2)+`), not a multiply.  `mulu.w
+>   Dn,Dn` (a register source) is correct.
 > * Only `d0`-`d7`/`a0`-`a7` exist; `d8+` is an "undefined expression".
 >   `MOVEQ` is data-register only.  Shift immediates are 1..8 and `ADDQ`
->   immediates are 1..8.  `MULU` has no register-register form.
-> * `mulu.w #$imm,Dn` multiplies **Dn** by the immediate and keeps the
->   result in Dn's low word (`C4FC` + the immediate).  For a 32-bit
->   product, split the operand and combine the halves by hand.
+>   immediates are 1..8.  `MULU` has no register-register *long* form
+>   ("unsupported for selected CPU").
+> * **Forward branches do work.** rmac sizes the displacement itself and
+>   the linker patches the deferred 16-bit form; the one exception is a
+>   branch to the *immediately following* instruction, which comes out
+>   as a NOP (`4E 71`) — the same behaviour, so it is harmless.
+> * Symbols are **case-sensitive** (`later` and `LATER` are different
+>   symbols).  A case mismatch is reported as
+>   `Error: undefined expression`, which reads like a toolchain bug but
+>   is not.
+> * A number without a `$` is **decimal**: `#00010020` is ten thousand
+>   and twenty, not `$10020`.  Always write hex constants with `$`.
 
 ```bash
 rmac -fb -o bench68k.o bench68k.s

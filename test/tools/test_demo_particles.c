@@ -34,12 +34,15 @@
 #define DEMO_SENT_DONE    0x00010004u
 #define DEMO_SENT_COUNT   0x00010008u
 #define DEMO_SENT_FRAME   0x0001000Cu
+#define DEMO_SENT_PART    0x00010010u
 #define DEMO_MAGIC_START  0xC0DE57A7u
 #define DEMO_MAGIC_DEMO   0xC0DE0068u   /* MB_MAGIC_68K */
 
 #define DEMO_PART_BASE    0x00110000u
-#define DEMO_PART_COUNT   256u
 #define DEMO_PART_STRIDE  16u   /* x, y, vx, vy as LONGs */
+/* The particle count is the ROM's business (it is a frame-time budget:
+ * the OP renders a full-screen bitmap every field and the 68000's
+ * framebuffer writes share that DRAM bus), so the ROM publishes it. */
 #define DEMO_SCR_W        320
 #define DEMO_SCR_H        240
 
@@ -326,10 +329,17 @@ int main(int argc, char **argv)
     /* The particle table must have moved: every particle's position must
      * be on screen, and the table must not be all zeros. */
     {
+        unsigned part_count = rd32(ram, DEMO_SENT_PART);
         unsigned p, onscreen = 0, nonzero = 0;
+        if (part_count == 0 || part_count > 4096)
+        {
+            fprintf(stderr, "FAIL: the ROM published %u particles\n", part_count);
+            failed = 1;
+            part_count = 1;
+        }
         int32_t minx = 1 << 30, maxx = -(1 << 30);
         int32_t miny = 1 << 30, maxy = -(1 << 30);
-        for (p = 0; p < DEMO_PART_COUNT; p++) {
+        for (p = 0; p < part_count; p++) {
             uint32_t a = DEMO_PART_BASE + p * DEMO_PART_STRIDE;
             int32_t x  = (int32_t)rd32(ram, a);
             int32_t y  = (int32_t)rd32(ram, a + 4);
@@ -343,12 +353,12 @@ int main(int argc, char **argv)
             if (y < miny) miny = y;
             if (y > maxy) maxy = y;
         }
-        printf("DEMO particles nonzero=%u onscreen=%u x=[%d..%d] y=[%d..%d]\n",
-               nonzero, onscreen, minx, maxx, miny, maxy);
+        printf("DEMO particles count=%u nonzero=%u onscreen=%u x=[%d..%d] y=[%d..%d]\n",
+               part_count, nonzero, onscreen, minx, maxx, miny, maxy);
         {
             int32_t vmin = 1<<30, vmax = -(1<<30);
             unsigned q;
-            for (q = 0; q < DEMO_PART_COUNT; q++) {
+            for (q = 0; q < part_count; q++) {
                 uint32_t b = DEMO_PART_BASE + q * DEMO_PART_STRIDE;
                 int32_t v = (int32_t)rd32(ram, b + 8);
                 if (v < vmin) vmin = v;
@@ -356,19 +366,31 @@ int main(int argc, char **argv)
             }
             printf("DEMO velocities vx=[%d..%d]\n", vmin, vmax);
         }
-        if (nonzero != DEMO_PART_COUNT) {
+        if (nonzero != part_count) {
             fprintf(stderr, "FAIL: %u/%u particles never moved\n",
-                    DEMO_PART_COUNT - nonzero, DEMO_PART_COUNT);
+                    part_count - nonzero, part_count);
             failed = 1;
         }
-        if (onscreen != DEMO_PART_COUNT) {
+        if (onscreen != part_count) {
             fprintf(stderr, "FAIL: %u particles off screen\n",
-                    DEMO_PART_COUNT - onscreen);
+                    part_count - onscreen);
             failed = 1;
         }
     }
 
-    harness_report(&cfg, &res, 0);
+    if (!failed)
+    {
+        res.status = "PASS";
+        res.name   = "particle_demo";
+        res.detail = "the particle burst simulated, stayed on screen and rendered";
+    }
+    else
+    {
+        res.status = "FAIL";
+        res.name   = "particle_demo";
+        res.detail = "the particle demo did not simulate or render correctly";
+    }
+    harness_report(&cfg, &res, 1);
     harness_shutdown(&cfg);
     free(st.rgb);
     return failed ? 1 : 0;
