@@ -334,3 +334,94 @@ rmac: use cmpi not cmp for immediates; no displacement addressing;
   assertions (the probe ROM has no particles)
 - `test/microbench/README.md` — document the video path + the rmac table
 - `test/microbench/build.sh` — add the new ROMs so they rebuild
+
+
+---
+
+## 8. UPDATE (same day, later) — the video path SOLVED
+
+The part above stalled on "the demo is still black".  It is solved now;
+here is what the remaining causes were, in the order they bit.
+
+### 8.1 The four fixes that made the gradient appear
+
+| # | symptom | cause | fix |
+|---|---|---|---|
+| 1 | screen black although the OP filled the line buffer | the core recomputes `tomWidth`/`tomHeight` **only when a TOM register in `$28..$4F` is written** (`tom.c`, "detect screen resolution changes"); a ROM that never writes VMODE leaves `tomWidth = 0` and the scanline renderers draw **zero pixels per row** | write VMODE/VDB/VDE at startup |
+| 2 | pixels appear but as the wrong colours | `VMODE` bit 8 (`VARMOD`) selects the **per-pixel RGB555/CRY mix** renderer (mode 4); without it the core uses the CRY renderer (mode 0) where a 16-bit pixel is a cyan/red/yellow colour | `VMODE = $07C1`, and set **bit 0** in every pixel (bit 0 = "RGB, not CRY") |
+| 3 | the colours are the right *values* but the wrong *hue* | RGB16 is `R[15:11] B[10:6] G[5:0]` — green is the low **six** bits and blue sits above it (`docs/jtrm-object-processor.md`; the core's `RGB16ToRGB32[]` agrees).  The usual 5-6-5 intuition is wrong here | pack green into bits 5..0, blue into 10..6 |
+| 4 | the picture is shifted/swapped | **the OP fetches phrases little-endian; the 68000 is big-endian.**  The LBUF shows the source bytes reversed | store every 16-bit pixel **byte-swapped** |
+
+Two more, found while porting the fixes to the particle demo:
+
+| # | symptom | cause | fix |
+|---|---|---|---|
+| 5 | the OP draws one line and then nothing | the object is consumed once per **field**, and the re-arm fired on **every poll** inside the blanking window (38 times per field), racing the OP's write-back until the object was exhausted | wait *up* (VC inside the window) then *down* (VC wrapped) and re-arm **once**, in the blanking before the OP's first pass |
+| 6 | the burst flies off the screen | `fb_addr` clobbered `d1` — the particle loop's **DBRA counter** — so the loop ran 65536 times | fixed the register discipline: the subroutines may only touch `d0`, `d4`, `d5`; `d1`/`d2`/`d3`/`d6`/`d7` are live in the caller |
+
+### 8.2 The rmac/rln limits (upstream, pinned SHA 50e66ea)
+
+Confirmed against a fresh clone of the pinned upstream, so not local damage:
+
+* **Forward branch references cannot be resolved.**  rmac defers a
+  branch to a label defined *later* in the file to the linker; rln can
+  only patch a 16-bit displacement, so a short branch that needs patching
+  makes rln fail outright.  **Every branch in an rmac-assembled ROM must
+  target a label defined EARLIER in the file.**  The five benchmark ROMs
+  only ever branch backwards, which is why this never showed up before.
+  A conditional without a forward branch is a **backward loop whose body
+  comes first**: the body is unconditional, the backward branch repeats it
+  while the condition holds, and the fall-through is the "done" case.
+* `cmp #imm,Dn` assembles as a **branch** — the 68000's
+  compare-with-immediate is the separate `CMPI`, so write `cmpi.w`/`cmpi.l`.
+* `move.l Dn,<absolute>` is assembled **backwards**.
+* `lea disp(An),Am` swallows the following bytes as an absolute address —
+  there is no working displacement form; use pointer registers and
+  `add.l #n,An`.
+* Only `d0`-`d7`/`a0`-`a7` exist, `MOVEQ` is Dn-only, shift immediates
+  are 1..8, `ADDQ` immediates are 1..8, `MULU` has no register-register
+  form.
+
+### 8.3 Core-side findings (worth an upstream issue)
+
+* **A cart ROM starts with A7 = 0.**  `JaguarReset()` writes the SSP into
+  RAM[0] but never gives the 68000 a stack pointer; the CD HLE path does
+  (`m68k_set_reg(M68K_REG_SP, 0x00200000)`), the cart path does not.  A
+  cart ROM that uses `jsr`/`rts` must set A7 itself — otherwise the first
+  `jsr` pushes its return address at `$FFFFFFFC` (discarded) and the `rts`
+  returns to garbage.  The five benchmark ROMs never call a subroutine,
+  which is why nobody noticed.
+* `move.w #$2700,sr` is dangerous in this core: Musashi's `MakeFromSR`
+  swaps the active stack pointer to the SSP (`regs.isp`) on that
+  transition, and the SSP is never initialised for the cart path.  Stay
+  in supervisor mode (it is what the IRQ path wants) and set A7 explicitly.
+
+### 8.4 What the demo ROMs are
+
+| file | what it is |
+|---|---|
+| `test/microbench/benchdemo_vidprobe.s` | the smallest ROM that puts a picture on the screen (a full-screen gradient) |
+| `test/microbench/benchdemo_particles.s` | 256 particles exploding from the centre, each with its own colour |
+| `test/microbench/benchdemo_min.s` | geometry + object + OLP + fill, nothing else |
+| `test/microbench/benchdemo_acid.s` | a port of the acid test's 16-bpp BITOBJ scenario (the repo's own `test/acid/tests/op/op_bitmap_render.s`), so the question can be answered without `vasm` |
+| `test/microbench/benchdemo_stacktest.s` | probes the A7 finding |
+| `test/microbench/benchdemo_formtest.s` | which 68000 instruction forms this assembler gets right |
+| `test/microbench/run_demo.sh` | installs the fresh core into RetroArch and launches it with the ROM |
+| `test/tools/test_demo_particles.c` | headless driver: lit-pixel count, PNG frame dumps, "the particles moved" assertion |
+| `test/tools/probe_op_bitmap.c` | decodes/dumps the OP object list and the line buffer |
+| `test/tools/probe_tom_regs.c` | dumps TOM's registers and the CLUT after a run (the "what does a working game program?" tool) |
+
+### 8.5 Calibration that unlocked it
+
+Running a **known-good public ROM** (`test/roms/yarc.j64`) through the
+same harness showed 61 022 lit pixels and a correct Atari Karts HC
+attract screen.  That proved the core's video path was fine and the
+problem was in the ROM — and the probe tools then answered "what does a
+working game program?" (mode 0/CRY, VDB 25, VDE 507, a **1 bpp** object:
+a palette index, so the endianness of the pixel data does not matter).
+
+### 8.6 Status
+
+Committed as `de1515f` and pushed.  The demo renders; RetroArch shows it
+(`test/microbench/run_demo.sh`).  Sample frames are in
+`docs/images/`.
