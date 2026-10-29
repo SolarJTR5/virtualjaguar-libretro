@@ -88,7 +88,7 @@ done
 # the cart base.  A source that .incbin's a *_gpu.bin/*_dsp.bin blob (just
 # produced above) picks it up automatically -- rmac resolves .incbin
 # relative to this directory since we already cd'd here.
-for src in bench68k.s benchgpu_arith.s benchgpu_branch.s benchdsp.s benchblit.s benchgpu_interleave.s benchdsp_interleave.s benchdsp_mix.s benchgpu_particle.s benchgpu_particle_naive.s; do
+for src in bench68k.s benchgpu_arith.s benchgpu_branch.s benchdsp.s benchblit.s benchgpu_interleave.s benchdsp_interleave.s benchdsp_mix.s benchgpu_particle.s benchgpu_particle_naive.s benchdemo_vidprobe.s benchdemo_particles.s benchdemo_min.s benchdemo_acid.s benchdemo_stacktest.s; do
     [ -f "${src}" ] || continue
     base="${src%.s}"
     echo "==> ${base}"

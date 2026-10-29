@@ -565,6 +565,95 @@ each one's expected stall profile.
 
 ---
 
+## The demo ROMs — putting a picture on the Jaguar screen
+
+The five benchmark ROMs above are headless by design: they measure ticks,
+and every cycle they spend on video is a cycle that muddies the
+measurement.  Two extra ROMs here are the opposite — they exist to be
+**looked at**, and they are the proof that the whole video path works in
+this core:
+
+| ROM | what it shows |
+|---|---|
+| `benchdemo_vidprobe.j64` | a full-screen gradient — the smallest ROM that proves the Object Processor path |
+| `benchdemo_particles.j64` | 256 particles exploding from the screen centre, each with its own colour, on a 320×240 screen |
+
+Watch them in RetroArch:
+
+```bash
+test/microbench/run_demo.sh              # the particle explosion
+test/microbench/run_demo.sh vidprobe     # the gradient probe
+```
+
+The script copies the freshly built core into RetroArch's cores directory
+and launches it with the ROM loaded.  It needs RetroArch
+(`flatpak install --user flathub org.libretro.RetroArch`); if RetroArch is
+not installed it prints that command and exits.
+
+`test/tools/test_demo_particles.c` is the headless counterpart: it runs a
+demo ROM, counts the lit pixels, dumps every frame as a PNG
+(`--frames-out DIR`) and asserts that the simulation actually moved the
+particles.  Sample output is committed under `docs/images/`.
+
+### The recipe — how a 16-bpp Jaguar bitmap reaches the screen
+
+This is the part that took the whole session to get right, so it is
+written down here rather than rediscovered:
+
+1. **Program the display geometry.** The core recomputes `tomWidth` /
+   `tomHeight` only when a TOM register in `$28..$4F` is *written*
+   (`tom.c`, "detect screen resolution changes").  A ROM that never
+   writes VMODE leaves `tomWidth = 0`, and the scanline renderers then
+   draw **zero pixels per row** — a completely black screen even though
+   the OP filled the line buffer correctly.  Write VMODE/VDB/VDE at
+   startup.
+
+2. **VMODE's bit 8 (`VARMOD`) picks the pixel format.** Without it the
+   core uses mode 0, the **CRY** renderer, where a 16-bit pixel is a
+   cyan/red/yellow colour.  With it (mode 4) the *mixed* renderer runs
+   and **bit 0 of each pixel** picks RGB555-direct vs CRY.  For a plain
+   RGB picture use `VMODE = $07C1` and set bit 0 in every pixel.
+
+3. **RGB16 is `R[15:11] B[10:6] G[5:0]`** — green is the low *six*
+   bits and blue sits above it (`docs/jtrm-object-processor.md`; the core's
+   `RGB16ToRGB32[]` agrees).  The usual 5-6-5 intuition is wrong here.
+
+4. **The OP fetches phrases little-endian; the 68000 is big-endian.**
+   A 16-bit pixel must be stored **byte-swapped** in memory, or the OP
+   reads it with its halves exchanged.
+
+5. **The OP consumes the object once per field.** It decrements HEIGHT
+   and advances DATA on every line it renders, so the object must be
+   re-armed once per field (a field is `VP+1` = 524 halflines; the OP
+   renders the 240 even halflines of the visible window).
+
+6. **Re-arm in the blanking *before* the OP's first pass of the field**
+   (VC below VDB), not "whenever VC is past the visible window": the
+   blanking window is several halflines wide and a level test fires on
+   every poll in it.  Worse, each re-arm is two longword stores, and if
+   the OP reads the object between them it sees a fresh DATA with an
+   **exhausted HEIGHT**, skips the object, and the line comes out
+   background black.
+
+7. **The framebuffer holds 16-bit pixels written with WORD stores.** A
+   longword store pads every pixel to four bytes and the OP reads the
+   padding as pixels.
+
+### The BITOBJ encoding (from `src/tom/op.c`)
+
+```
+p0 = type | ypos<<3 | height<<14 | link<<21 | data<<40
+p1 = xpos | depth<<12 | pitch<<15 | dwidth<<18 | iwidth<<28
+```
+
+* `depth` 4 = 16 bpp.  `pitch` = bytes per phrase (1 → 8).
+  `dwidth` = **bytes** per source line (the field holds phrases: 80 for a
+  640-byte line).  `iwidth` = phrases to render (80 for 320 px) and it
+  **spills into the high longword**.
+* `link`/`data` are byte addresses with the low three bits clear.  The
+  LINK's high bits land in the **high longword bit 6** — one bit off
+  encodes link `$010010` (the sentinel block) and the screen stays black.
+
 ## Reading the RISC register file (host-only)
 
 `test/tools/risc_regdump.sh` prints the GPU or DSP register file as a
@@ -587,6 +676,49 @@ particle ROM's `r14`/`r15`/`r17` snapshot is a useful sanity check that
 the cursor and counter landed where the schedule model says they should.
 
 ## Assembling: what actually worked
+
+> **The toolchain cannot resolve a forward branch reference.** rmac
+> defers a branch to a label defined *later* in the file to the linker,
+> and rln can only patch a 16-bit displacement — an 8-bit short branch
+> that needs patching makes `rln` fail outright.  So **every branch in
+> an rmac-assembled ROM must target a label defined EARLIER in the
+> file**.  The five benchmark ROMs above only ever branch backwards, so
+> this never showed up; the demo ROMs hit it immediately (a `bhi.s` to a
+> forward label produced a garbage displacement and the ROM ran off into
+> the particle table).
+>
+> The way to write a conditional without a forward branch is a **backward
+> loop whose body comes first**: the body is unconditional, the backward
+> branch repeats it while the condition holds, and the fall-through is
+> the "done" case.  The demo ROMs use that shape everywhere.
+>
+> Other rmac limits worth knowing (all confirmed against the pinned
+> upstream SHA `50e66ea`, so they are not local damage):
+>
+> * `cmp #imm,Dn` assembles as a **branch** — the 68000's compare-with-
+>   immediate is the separate `CMPI` instruction, so write `cmpi.w` /
+>   `cmpi.l`.  A `cmp` with an immediate silently becomes an invalid
+>   instruction.
+> * `move.l Dn,<absolute>` is assembled **backwards** (it becomes
+>   `move.l #imm,Dn`).  Use `move.l #ADDR,aN` + `move.l Dn,(aN)`.
+> * `lea disp(An),Am` swallows the following bytes as an absolute
+>   address.  There is no working displacement form at all: address
+>   everything through pointer registers and `add.l #n,An`.
+> * `move.l Dn,(An)+` and friends do not use the textbook bit layout,
+>   but they do it *consistently*: the committed ROMs are built with the
+>   same encoding and behave correctly, so trust the assembler here and
+>   read the object file if you need to know what a byte means.
+> * Only `d0`-`d7`/`a0`-`a7` exist; `d8+` is an "undefined expression".
+>   `MOVEQ` is data-register only.  Shift immediates are 1..8 and `ADDQ`
+>   immediates are 1..8.  `MULU` has no register-register form.
+> * `mulu.w #$imm,Dn` multiplies **Dn** by the immediate and keeps the
+>   result in Dn's low word (`C4FC` + the immediate).  For a 32-bit
+>   product, split the operand and combine the halves by hand.
+
+```bash
+rmac -fb -o bench68k.o bench68k.s
+rln  -n -a 800000 x x -o bench68k.j64 bench68k.o
+```
 
 ```bash
 rmac -fb -o bench68k.o bench68k.s
