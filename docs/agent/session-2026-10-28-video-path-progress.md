@@ -425,3 +425,124 @@ a palette index, so the endianness of the pixel data does not matter).
 Committed as `de1515f` and pushed.  The demo renders; RetroArch shows it
 (`test/microbench/run_demo.sh`).  Sample frames are in
 `docs/images/`.
+
+---
+
+## 9. UPDATE (2026-10-29) — the demo renders, the audio path works, and the toolchain was lying to us
+
+### 9.1 The toolchain was locally corrupted — and it poisoned every conclusion drawn from it
+
+`tools/vendor/jaguar-toolchain/` is gitignored and shared between
+sessions.  Its rmac checkout had an **uncommitted local edit** to
+`68k.mch`:
+
+```diff
+-and   NBWL   C_DATA          M_DREG          %1100rrr0sseR1S00   m_ea      +
++and   NBWL   C_DATA          M_DREG          %1011rrr0sseR1S00   m_ea      +
+```
+
+`$C` (AND) became `$B` (CMP), so **every `and.l Dn,Dm` assembled as
+`cmp.l Dn,Dm`** — a silent, well-formed, completely wrong instruction.
+The audio demo's square wave was constant because of it, and the
+"rmac mis-assembles `SUB.L`" conclusion was an artefact of the same
+era's ROM bug (see 9.4).
+
+The edit is reverted (`git -C tools/vendor/jaguar-toolchain/rmac status`
+is clean again) and rmac was rebuilt from scratch.  **Check the
+vendored toolchain's git status before trusting anything it says** — and
+rebuild it with `make clean && make` so no stale object survives.  The
+new `test/microbench/benchdemo_alu.s` + `test/tools/test_demo_alu.c`
+are the tripwire: 16 register-register ALU forms checked against the
+68000's documented answers.
+
+### 9.2 The audio spike works — 68K -> LTXD/RTXD -> I2S -> DAC -> libretro
+
+`test/microbench/benchdemo_audio.s` + `test/tools/test_demo_audio.c`:
+
+```
+PASS: [audio_present]        the 68K-written I2S stream reaches the output
+PASS: [audio_stereo_match]   left and right carry the same signal
+PASS: [audio_tone_frequency] the tone is at the frequency the ROM asked for
+PASS: [audio_timer_rate]     the 68000's timer interrupt rate is as programmed
+```
+
+The tone is measured **against the ROM's own tick counter**, not against
+a hard-coded number: the ROM publishes how many timer interrupts it
+took, the test samples that counter in the same window as the audio,
+and the expected frequency is (tick rate / 16).  That matters because
+JERRY's pending-interrupt latch is cleared by the 68000's own write to
+JINTCTRL, so a timer tick that lands between the interrupt acknowledge
+and that write is swallowed — the measured tick rate is ~12% below the
+nominal 50 kHz, and the test says so rather than hiding it.
+
+The ROM also uses the **documented** JINTCTRL layout now (one 16-bit
+write, `$0404` = enable timer 1 + clear its pending latch).  The byte
+lanes of JINTCTRL in the core are swapped relative to that layout
+(`$F10020` is the enable mask and `$F10021` the clear field per the
+JTRM-derived notes in `docs/jtrm-jerry.md`; the core's byte handlers
+have them the other way round) — recorded here as an open question, not
+filed, because the manual itself is not in this checkout.
+
+### 9.3 The core's OP decodes DWIDTH together with PITCH — every bitmap is sheared by a byte per line
+
+`src/tom/op.c` decoded the OP's line stride as
+
+```c
+dwidth = (p1 & 0xFFC0000) >> 15;
+```
+
+`0xFFC0000` starts three bits below the DWIDTH field, so the **PITCH
+bits (15-17) became part of the stride**: a 16bpp bitmap with
+`PITCH = 1` was read one byte further along on every line, and the
+picture sheared 120 pixels by the bottom of a 320-pixel screen.  The
+fix is `0x3FC0000` (the DWIDTH field alone).
+
+This is what made the demo ROMs look like garbage.  With it fixed, the
+gradient demo renders a clean full-screen gradient and the particle demo
+renders a moving burst.
+
+### 9.4 The demo ROMs had bugs of their own — the list, so nobody re-derives it
+
+| bug | effect |
+|---|---|
+| `mulu.w #$imm,Dn` (rmac's immediate-EA form) | "multiplied" the *table pointer* and corrupted the particle table — the burst's velocities were garbage |
+| the framebuffer "clear" stored an incrementing counter | the screen was painted with a gradient, not cleared |
+| `draw_block` clobbered the DBRA counter (`d1`) | the particle loop stopped after one particle per frame |
+| `fb_addr` clobbered `d4` (the x coordinate) before using it | every particle was drawn at x = 7 |
+| `DBRA` runs the body N+1 times for a counter of N | `y*4` became `y*8` — the row address was wrong by a factor of two |
+| the velocities came from the top two bits of a 32-bit LCG | the LCG's top bits have a period of 4: every particle got nearly the same velocity and the "explosion" was a blob drifting up and left |
+| the byte-swap before storing a pixel | the core's OP reads the framebuffer big-endian; the swap threw the green away and dropped the word into CRY mode |
+| the DWIDTH field encoded as 64 instead of 80 phrases | the stride was 513 bytes instead of 640 — the picture was a smear |
+
+The demo now uses a **double buffer** (two framebuffers plus a small
+"shadow" table per buffer recording the positions that buffer holds),
+which is what removes the trails: the back buffer is erased exactly,
+because the shadow table says exactly what it contains.
+
+### 9.5 What the demo does now
+
+64 particles, each a 2x2 block, bouncing off the screen edges so the
+burst never settles, with the hue rotating every frame.  The particle
+count is a **budget**, not a taste: the OP renders a full-screen bitmap
+every field and the 68000's framebuffer writes share that DRAM bus, so
+64 particles x (2 erase + 2 draw + 1 shadow) = 320 writes is about 6 ms
+— comfortably inside one 16.6 ms field.  Draw more and the drawing
+overruns the field, the object cannot be re-armed in time, its
+remaining height runs out and the screen decays to black.
+
+`test/tools/test_demo_particles.c` reads the particle count from the
+ROM's sentinel block (the ROM's business) and checks that every
+particle moved, stayed on screen, and that the screen is lit.
+
+### 9.6 The upstream drafts were rewritten
+
+`docs/agent/upstream-issue-drafts.md` now carries three issues, all
+reproduced against a **pristine** build of the pinned toolchain:
+
+1. the cart HLE boot never initialises the 68000's user stack pointer;
+2. rmac mis-assembles a label in an indexed form, loses the index scale
+   of `d(An,Am)`, and encodes `cmp #imm` as an immediate-EA CMP;
+3. the OP's DWIDTH/PITCH decode (this session's core bug).
+
+The file also keeps a **"Claims that did not reproduce"** section, with
+the reason each was wrong, so the false ones are not filed again.

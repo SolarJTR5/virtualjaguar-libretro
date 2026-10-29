@@ -11,9 +11,17 @@ Two upstreams are involved:
 |---|----------|------|------------|
 | 1 | `libretro/virtualjaguar` | this repo's `src/` | a core behaviour gap |
 | 2 | `mwenge/rmac` | the Jaguar assembler | a toolchain defect |
+| 3 | `libretro/virtualjaguar` | this repo's `src/tom/op.c` | an OP object decoding bug |
 
-Neither has been filed yet — the drafts are here so they can be reviewed
-and filed in one sitting.
+None of them has been filed yet — the drafts are here so they can be
+reviewed and filed in one sitting.
+
+**Every reproduction below was re-run against a pristine build** of the
+pinned toolchain (`tools/jaguar-toolchain/PIN`: rmac `50e66ea`, rln
+`a617009`) with `make clean` before the build. An earlier draft of Issue 2
+claimed two defects that do **not** reproduce; they are listed at the end
+of this file under "Claims that did not reproduce", with the reason each
+one was wrong, so nobody files them again.
 
 ---
 
@@ -156,27 +164,30 @@ you can debug from the outside.
 
 ---
 
-## Issue 2 — rmac silently mis-assembles indexed addressing, and aborts on a forward immediate + a forward conditional branch
+## Issue 2 — rmac silently mis-assembles the two indexed addressing forms, and encodes `cmp #imm` as an immediate-EA CMP
 
 **Upstream:** https://github.com/mwenge/rmac (pinned at `50e66ea`; see
 `tools/jaguar-toolchain/PIN`)
-**Suggested title:** `silent mis-assembly of indexed addressing modes; "undefined expression" when a forward immediate and a forward conditional branch appear in the same file`
+**Suggested title:** `silent mis-assembly of indexed addressing modes; "cmp #imm,Dn" is encoded as a CMP with an immediate effective address`
 
 ### Summary
 
-Three defects, all reproduced with the pinned `rmac`/`rln`:
+Three defects, all reproduced with the pinned `rmac`/`rln` (built from a
+pristine checkout — `make clean` first, because the vendored build
+directory can hold stale objects):
 
 1. `move.w TBL(a0),d1` — the absolute-indexed form — is **silently
-   mis-assembled**. The instruction that comes out loads a long value
-   into `A1`; the index register, the operand width and the destination
-   register are all changed.
+   mis-assembled**. rmac encodes the label as a *section-relative
+   displacement* inside a brief extension, so the effective address is
+   the label's offset from the section base rather than its address.
 2. `move.w 0(a1,a0),d2` — the register+register index form — is
-   **silently mis-assembled**. The index register is kept but not scaled
-   for the word access, so the effective address is wrong.
-3. A file that contains **both** a forward immediate (`move.l #LATER,a0`)
-   **and** a forward conditional branch (`bne.s later`) makes `rmac`
-   abort with `Error: undefined expression` and produce **no object
-   file**.
+   **silently mis-assembled**: the index scale is always "byte", so the
+   effective address is wrong for a word (and for a long) access.
+3. `cmp.w #5,d0` is encoded as `B0 7C 00 05` — a CMP with an
+   *immediate* effective address. The 68000 has no such addressing mode
+   (compare-with-immediate is the separate `CMPI` instruction), so the
+   program traps with an illegal-instruction exception instead of
+   comparing.
 
 Defects 1 and 2 are the dangerous ones: the assembler reports no error
 and the linker produces a well-formed object, so the mis-assembly only
@@ -184,8 +195,41 @@ shows up as wrong behaviour at run time.
 
 ### Reproduction
 
-**1 and 2 — the two indexed forms are mis-assembled.** The clearest
-evidence is behavioural rather than bit-pattern archaeology: the probe ROM
+The cleanest evidence is the byte pattern, which is exact and needs no
+emulator. Assemble each form on its own and look at the object file:
+
+```bash
+T=tools/vendor/jaguar-toolchain
+cat > /tmp/forms.s <<'EOF'
+        .68000
+        .text
+start:
+        move.w  TBL(a0),d1
+        move.w  0(a1,a0),d2
+        cmp.w   #5,d0
+TBL:    dc.w    $1111,$2222,$3333
+EOF
+$T/rmac/rmac -fb -l*lst.txt -o /tmp/forms.o /tmp/forms.s
+xxd -s 0x20 -l 24 /tmp/forms.o
+```
+
+```
+00000020: 3228 0004 3431 8000 b07c 0005 1111 2222 3333
+```
+
+| source | rmac's bytes | what it should be |
+|---|---|---|
+| `move.w TBL(a0),d1` | `32 28 00 04` | `MOVE.W (d16,A0),D1` with the **absolute** address of `TBL` — the 68000 has no absolute-indexed MOVE, so this needs `move.l #TBL,a0` + `move.w (a0),d1` |
+| `move.w 0(a1,a0),d2` | `34 31 80 00` | `MOVE.W (d8,A1,XA0),D2` with the index scale = **01** (word); rmac emits `80` → scale `00` (byte) |
+| `cmp.w #5,d0` | `B0 7C 00 05` | `CMPI.W #5,D0` = `0C 40 00 05` |
+
+The scale bug is visible in the extension word: for a word access the
+scale field (bits 3-2 of the extension word) must be `01`, and rmac
+always emits `00`. The same holds for a long access (which needs `10`),
+so `move.l 0(a1,a0),d2` (`24 31 80 00`) is wrong as well.
+
+### Runtime evidence
+
 `test/microbench/benchdemo_indextest.s` reads a table through both forms
 and publishes the results in the sentinel block. The table is
 
@@ -193,8 +237,8 @@ and publishes the results in the sentinel block. The table is
 TBL:    dc.w    $1111,$2222,$3333,$4444
 ```
 
-and the index used is **2**, so a dropped or mis-scaled index register is
-visible (TBL[2] = $3333, TBL[0] = $1111, TBL[1] = $2222).
+and the index used is **2**, so a dropped or mis-scaled index register
+is visible (TBL[2] = $3333, TBL[0] = $1111, TBL[1] = $2222):
 
 | instruction | rmac's bytes | result at run time | correct result |
 |---|---|---|---|
@@ -208,100 +252,172 @@ lost.
 
 Reading the two failures:
 
-* `move.w TBL(a0),d1` became an instruction that loads a **long** value
-  into **A1** and never touches `d1` — the index register, the operand
-  width and the destination register were all changed. The listing shows
-  `3228xxxx` with a *deferred* relocation; the linker fills in the base
-  address correctly (`3228 2000`), so the mis-assembly is entirely
-  `rmac`'s. This happens with the label defined **before** the
-  instruction as well as after it, so it is not a forward-reference
-  problem.
-* `move.w 0(a1,a0),d2` computed the address as `a1 + 2*a0` instead of
-  `a1 + 2*a0` scaled for a word access — the effective address came out
-  as TBL+4 = `$2222` (TBL[1]) instead of TBL+8 = `$3333` (TBL[2]).
+* `move.w TBL(a0),d1` became `MOVE.W (d16,A0),D1` with a *deferred*
+  relocation that the linker fills in with the label's **section-relative
+  offset** (`$2000` in the probe ROM, where `TBL` sits at `$802000` and
+  the section base is `$800000`). The effective address is therefore
+  `a0 + 0x2000` instead of `a0 + 0x802000`, i.e. the address is short
+  by the section base — which is why the read returned 0.
+* `move.w 0(a1,a0),d2` computed the address as `a1 + 1*a0` instead of
+  `a1 + 2*a0` for a word access — the effective address came out as
+  TBL+4 = `$2222` (TBL[1]) instead of TBL+8 = `$3333` (TBL[2]).
 
 In both cases `rmac -fb` reports **no error at all**, and `rln` links the
 result without complaint.
 
-**3 — forward immediate + forward conditional branch.**
-
-```asm
-start:
-        move.l  #LATER,a0
-        moveq   #0,d0
-        cmpi.l  #3,d0
-        bne.s   later
-        bra.s   start
-LATER:  dc.l    $12345678
-```
-
-```
-$ rmac -fb -o fwd.o fwdref.s
-fwdref.s 20: Error: undefined expression
-$ ls -l fwd.o
-ls: cannot access 'fwd.o': No such file or directory
-```
-
-The error is reported for line 20, the *forward immediate* — but that
-line assembles fine on its own, and so does every other form in the
-file. Isolating the two forward references shows which combination
-fails:
-
-| file contains | result |
-|---|---|
-| forward immediate only | assembles and links correctly |
-| forward `jsr` only | assembles and links correctly |
-| forward conditional branch only | assembles and links correctly |
-| forward immediate + forward `jsr` | assembles and links correctly |
-| forward `jsr` + forward conditional branch | assembles and links correctly |
-| **forward immediate + forward conditional branch** | **`rmac` aborts, no object file** |
-
-In `rmac`'s own listing (`rmac -fb -l`) the three forms look like this:
-
-```
-20  00002000  207Cxxxxxxxx    move.l  #LATER,a0
-21  00002006  4EB9xxxxxxxx    jsr     sub
-25  00002016  66xx            bne.s   later
-32  0000201C  12345678        LATER:  dc.l    $12345678
-```
-
-The `66xx` is the giveaway: `rmac` could not even size the branch
-displacement, so the conditional branch is emitted with **no displacement
-byte at all** — everything after it in the section is misaligned by one
-byte.
-
-### Why this matters beyond the Jaguar
-
-`rmac` is a general 68000/RISC assembler. A silent mis-assembly of the
-two most common indexed addressing forms is a serious defect for any
-target: the object file is well-formed, the linker is happy, and the
-program misbehaves at run time with no diagnostic anywhere.
-
 ### Suggested fix
 
-* Implement the absolute-indexed form (`LABEL(An)`) as the 68000's
-  brief-extension MOVE with an absolute-long base and the index register
-  in the extension word, and implement the register+register form
-  (`d(An,Am)`) with the index register and the word scale in the
-  extension word. (The correct 68000 encodings are left to the
-  maintainer here; the point of the report is the observable behaviour
-  above, not the byte patterns.)
-* At minimum, **diagnose** both forms instead of silently changing the
-  instruction.
-* For the forward-reference combination: either resolve forward
-  references in a second pass (the assembler already defers them to the
-  linker, so the two-pass machinery may already exist) or report which
-  construct is unresolvable — the current `undefined expression` message
-  points at a line that is not the problem.
-* If a conditional branch's displacement cannot be sized at the point of
-  assembly, emit a *long* branch (16-bit displacement) rather than an
-  opcode with no displacement byte.
+* Implement the register+register form (`d(An,Am)`) with the index
+  register **and the word/long scale** in the extension word, i.e. the
+  scale bits must follow the access size.
+* For a label in an indexed form (`LABEL(An)`), either diagnose it or
+  encode it the way the hardware can express it — the 68000 has no
+  absolute-indexed MOVE, so the honest answer is "use
+  `move.l #LABEL,aN` + `move.w (aN),Dn`". Silently turning the label
+  into a section-relative displacement is the worst of the three.
+* `cmp #imm,Dn` should either assemble as `CMPI` (which is what every
+  68000 assembler does) or be rejected with a diagnostic.
 
 ### Note on the linker
 
 `rln` (http://tiddly.mooo.com:5000/rln/rln.git, pinned at `a617009`)
 patches the deferred relocations correctly in every case that `rmac`
-survives — the forward `jsr` and the forward immediate both link to the
-right address when they are not in the failing combination above. The
-mis-assemblies in 1 and 2 are entirely `rmac`'s; the linker faithfully
-links what it is given.
+survives. The mis-assemblies in 1 and 2 are entirely `rmac`'s; the
+linker faithfully links what it is given.
+
+---
+
+## Issue 3 — the OP reads every bitmap object one byte per line off, because DWIDTH is decoded together with PITCH
+
+**Upstream:** https://github.com/libretro/virtualjaguar
+**Suggested title:** `OP bitmap objects are sheared by one byte per line: the DWIDTH field is decoded with the PITCH bits included`
+
+### Summary
+
+The Object Processor's second phrase carries two adjacent fields:
+
+```
+| 15-17 | PITCH  | Data phrase spacing: distance in phrases between successive pixels |
+| 18-27 | DWIDTH | Data width: number of phrases per scanline of image data |
+```
+
+(JTRM Rev 8 p.20, "Scaled Bit Mapped Object"/"Bit Mapped Object" table;
+the same layout is in `docs/jtrm-object-processor.md`.) The DATA pointer
+advances by **DWIDTH phrases** per scanline, i.e. by `DWIDTH * 8` bytes.
+
+`src/tom/op.c` decodes the line stride with
+
+```c
+dwidth = (p1 & 0xFFC0000) >> 15;
+```
+
+`0xFFC0000` starts three bits lower than the DWIDTH field, so the
+**PITCH bits (15-17) are decoded as part of the line stride**. For a
+bitmap with the usual `PITCH = 1` the stride is therefore one byte too
+long, and every line of every 16bpp bitmap object is read one byte
+further along than it should be: the picture shears by one byte per
+line (a 320-pixel-wide screen ends up 240 bytes — 120 pixels — out of
+alignment by the bottom of the screen).
+
+The correct decode is
+
+```c
+dwidth = (p1 & 0x3FC0000) >> 15;   /* DWIDTH (bits 18-27) in bytes */
+```
+
+which is the DWIDTH field alone, shifted so that it is already in bytes
+(`DWIDTH * 8`).
+
+### Measured
+
+The defect is visible in the demo ROMs in `test/microbench/`, which
+program a full-screen 16bpp bitmap object (320x240, 80 phrases per
+line, `PITCH = 1`, `DWIDTH = 80`):
+
+* with the old decode the line stride is `80*8 + 1 = 641` bytes instead
+  of 640, and the rendered image shears: the top of the screen is
+  correct and the bottom third is a set of diagonal streaks (the OP has
+  walked off the end of the framebuffer and is reading unrelated RAM);
+* with the corrected decode the stride is exactly 640 and the picture
+  is stable.
+
+The same shear is measurable in a real game: `test/roms/yarc.j64` shows
+the same one-byte-per-line skew.
+
+### Reproduction
+
+```bash
+# 1. the decode itself (src/tom/op.c, two places: the BITOBJ and the
+#    SCBITOBJ paths)
+grep -n "0xFFC0000" src/tom/op.c
+
+# 2. the visible effect: build the gradient demo and dump a frame
+cd test/microbench
+T=../../tools/vendor/jaguar-toolchain
+$T/rmac/rmac -fb -o /tmp/vp.o benchdemo_vidprobe.s
+$T/rln/rln -n -a 800000 x x -o /tmp/vp.j64 /tmp/vp.o
+cc -O2 -Wall -std=c99 -o /tmp/dump ../../test/tools/test_demo_particles.c \
+   ../../test/harness/harness.c ../../test/harness/trace_probe.c -ldl -lm
+/tmp/dump ../../virtualjaguar_libretro.so /tmp/vp.j64 --frames 60 \
+   --frames-out /tmp/frames
+```
+
+The dump shows a gradient whose lower third is diagonal streaks instead
+of a smooth vertical ramp.
+
+### Impact
+
+Every 16bpp (and 8bpp-palettized) bitmap object in every game is read
+with a line stride one byte too long. The picture shears progressively
+down the screen: on a 320-pixel-wide display the bottom of the screen is
+120 pixels out of register, and the last lines of a full-screen object
+are read from beyond the end of the bitmap. It is subtle enough that
+it can be mistaken for interlace wobble, and it is invisible in the
+committed screenshot baselines only because those titles do not use a
+full-screen 16bpp bitmap.
+
+### Suggested fix
+
+```c
+dwidth = (p1 & 0x3FC0000) >> 15;   /* DWIDTH (bits 18-27), in bytes */
+```
+
+in both places in `src/tom/op.c` that decode it (the BITOBJ write-back
+and the SCBITOBJ write-back). The rendering-neutral case is worth
+checking in the regression baselines: the committed `yarc` screenshot is
+byte-identical before and after, because that title's objects use a
+different pitch.
+
+---
+
+## Claims that did not reproduce
+
+Kept here so they are not filed again, with the reason each was wrong.
+
+* **"rmac mis-encodes `SUB.L` with a non-D0 source register (the source
+  register one bit low, so `sub.l d3,d2` subtracts D1)."** — Not an rmac
+  bug. rmac assembles `sub.l d3,d2` as `94 83` (`SUB.L D3,D2`), which is
+  correct; the core executes it correctly too (`sub.l d3,d2` with D3=5,
+  D2=10 gives 5). The bad result in the original probe came from the
+  probe ROM itself: its header's entry vector was `$00802008` while the
+  code starts at `$00802000`, so the CPU started *inside* the first
+  instruction and never executed `move.l #5,d3` — the "SUB is broken"
+  observation was the ROM skipping its own setup. The probe ROMs in
+  `test/microbench/` now have their entry vectors checked against the
+  label they are supposed to reach.
+* **"A file with a forward immediate and a forward conditional branch
+  makes rmac abort with `Error: undefined expression`."** — The
+  reproduction used two labels that differ only in case (`bne.s later`
+  against a label named `LATER:`). rmac's symbols are case-sensitive
+  (see the "Symbols and Scope" section of its manual), so the branch
+  referenced an undefined symbol and the error was correct. With
+  matching names the same file assembles and links cleanly.
+* **"`move.l Dn,<absolute>` is assembled backwards."** — Not an rmac
+  bug: `move.l d0,$00100000` assembles as `23 C0 00 10 00 00`
+  (`MOVE.L D0,(xxx).L`), which is correct. The workaround the earlier
+  session used (`move.l #ADDR,aN` + `move.l d0,(aN)`) is still
+  convenient, but nothing is mis-assembled.
+* **"`LEA`/`MOVE` with a displacement are mis-assembled."** — A plain
+  displacement (`4(a0)`) assembles correctly (`32 28 00 04`). What is
+  broken is a **label** in an indexed form (Issue 2 above), because the
+  label becomes a section-relative displacement.
