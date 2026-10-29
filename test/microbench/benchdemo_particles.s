@@ -202,6 +202,11 @@ PALETTE        .equ    $00112000          ; 64 colour words (RGB555)
 ; multiplicative LCG, whose period is 4 -- every particle got nearly the
 ; same velocity and the "explosion" was a blob drifting up and to the
 ; left.
+; The background colour.  The core's MIX16 table selects RGB16 or CRY
+; from bit 0 of the 16-bit pixel, and CRY 0 decodes to a grey, so a black
+; background is RGB16 black WITH the select bit set.
+BG_COLOUR     .equ    $0001
+
 VEL_SHIFT_X   .equ    27
 VEL_SHIFT_Y   .equ    22
 VEL_MASK      .equ    $001F               ; 5 bits -> -16..15
@@ -376,10 +381,13 @@ palbuild:
 
 
 ; ---- 5. clear both framebuffers -------------------------------------
-; The clear writes ZEROS: storing an incrementing counter here (which is
-; what this loop used to do) paints a gradient over the screen instead
-; of clearing it.
-        move.w  #0,d0
+; The clear stores LONGWORDS, and a longword holds two pixels -- so the
+; background colour has to be in BOTH halves of the word.  With the
+; colour in one half only, every other pixel of the screen rendered as
+; CRY grey (the core's MIX16 table picks RGB16 or CRY from bit 0 of the
+; pixel), which showed up as vertical stripes across the picture.
+        move.w  #BG_COLOUR,d0
+        swap    d0
         move.w  #((SCR_H*SCR_W)/2)-1,d1  ; 38400 longword stores
         move.l  #FB_A,a0
 fbclrA:
@@ -575,7 +583,7 @@ py_done:
 ; ---------------------------------------------------------------------
 erase_block:
         jsr     fb_addr                 ; a0 = the pixel address
-        moveq   #0,d0
+        move.w  #BG_COLOUR,d0
         move.w  d0,(a0)
         addq.l  #2,a0
         move.w  d0,(a0)
