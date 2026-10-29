@@ -138,7 +138,11 @@ PARTICLE_BASE  .equ    $00110000          ; 256 * 16 bytes = 4096
         STOP_P0_LO     .equ    $00000004
 
 ; --- physics ---------------------------------------------------------
-        DRIFT          .equ    -1                 ; upward drift per frame (decays)
+        ; The burst's upward drift DECAYS with the velocity: a constant -1 per
+; frame accumulated (the drag never touched it) and carried every particle
+; off the top of the screen within seconds -- the "then black" you saw
+; after the initial burst.  Zero keeps the burst where it is.
+DRIFT          .equ    0                  ; no constant drift: the burst settles
         CENTER_X       .equ    SCR_W/2
         CENTER_Y       .equ    SCR_H/2
 
@@ -229,8 +233,8 @@ seedloop:
 seed_shr29:
         lsr.l   #1,d2
         dbra    d3,seed_shr29            ; 29 shifts -> seed >> 29
-        andi.l  #7,d2
-        sub.l   #3,d2
+        andi.l  #$000F,d2               ; the speed: -8..7 (the drag is
+        sub.l   #8,d2                   ; 15/16, so this spreads ~128 px)
         move.l  d2,(a3)
 
         ; vy: a pseudo-random value in -6..-1 (the burst goes UP first)
@@ -239,8 +243,8 @@ seed_shr29:
 seed_shr26:
         lsr.l   #1,d2
         dbra    d3,seed_shr26            ; 26 shifts -> seed >> 26
-        andi.l  #7,d2
-        sub.l   #6,d2
+        andi.l  #$000F,d2               ; the speed: -8..7
+        sub.l   #8,d2
         move.l  d2,(a4)
 
         ; next seed: seed = seed*1664525 + 1013904223, computed with the
@@ -338,8 +342,12 @@ particleloop:
         ;     every conditional in this ROM is written as a backward loop.
         add.l   d6,d4                    ; x += vx
         add.l   d7,d5                    ; y += vy
-        asr.l   #3,d6                    ; drag: vx /= 8
-        asr.l   #3,d7                    ; drag: vy /= 8
+        move.l  d6,d0
+        asr.l   #4,d0
+        sub.l   d0,d6                    ; drag: vx -= vx/16 (15/16 left)
+        move.l  d7,d0
+        asr.l   #4,d0
+        sub.l   d0,d7                    ; drag: vy -= vy/16
         addi.l  #DRIFT,d7                ; a little upward drift
 
         ; --- store the new state

@@ -27,6 +27,7 @@
 #include <stdbool.h>
 #include <sys/stat.h>
 #include "../harness/harness.h"
+#include "../harness/trace_probe.h"
 
 /* The demo ROM's memory map (benchdemo_particles.s). */
 #define DEMO_SENT_START   0x00010000u
@@ -283,6 +284,11 @@ int main(int argc, char **argv)
     cfg.video_callback = demo_video_cb;
     cfg.video_callback_data = &st;
 
+    if (!trace_probe_attach(&cfg)) {
+        fprintf(stderr, "test_demo_particles: trace_probe_attach failed\n");
+        harness_shutdown(&cfg);
+        return 2;
+    }
     if (!harness_load_rom(&cfg)) {
         fprintf(stderr, "test_demo_particles: failed to load ROM\n");
         harness_shutdown(&cfg);
@@ -325,10 +331,11 @@ int main(int argc, char **argv)
         int32_t miny = 1 << 30, maxy = -(1 << 30);
         for (p = 0; p < DEMO_PART_COUNT; p++) {
             uint32_t a = DEMO_PART_BASE + p * DEMO_PART_STRIDE;
-            int32_t x = (int32_t)rd32(ram, a);
-            int32_t y = (int32_t)rd32(ram, a + 4);
+            int32_t x  = (int32_t)rd32(ram, a);
+            int32_t y  = (int32_t)rd32(ram, a + 4);
             int32_t vx = (int32_t)rd32(ram, a + 8);
             int32_t vy = (int32_t)rd32(ram, a + 12);
+
             if (x || y || vx || vy) nonzero++;
             if (x >= 0 && x < DEMO_SCR_W && y >= 0 && y < DEMO_SCR_H) onscreen++;
             if (x < minx) minx = x;
@@ -338,6 +345,17 @@ int main(int argc, char **argv)
         }
         printf("DEMO particles nonzero=%u onscreen=%u x=[%d..%d] y=[%d..%d]\n",
                nonzero, onscreen, minx, maxx, miny, maxy);
+        {
+            int32_t vmin = 1<<30, vmax = -(1<<30);
+            unsigned q;
+            for (q = 0; q < DEMO_PART_COUNT; q++) {
+                uint32_t b = DEMO_PART_BASE + q * DEMO_PART_STRIDE;
+                int32_t v = (int32_t)rd32(ram, b + 8);
+                if (v < vmin) vmin = v;
+                if (v > vmax) vmax = v;
+            }
+            printf("DEMO velocities vx=[%d..%d]\n", vmin, vmax);
+        }
         if (nonzero != DEMO_PART_COUNT) {
             fprintf(stderr, "FAIL: %u/%u particles never moved\n",
                     DEMO_PART_COUNT - nonzero, DEMO_PART_COUNT);
