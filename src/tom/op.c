@@ -745,7 +745,19 @@ void OPProcessList(int halfline, bool render)
                      height--;
 
                      data = (p0 & 0xFFFFF80000000000LL) >> 40;
-                     dwidth = (p1 & 0xFFC0000) >> 15;
+                     /* DWIDTH is bits 18-27 of the object's second phrase: the number of
+                      *phrases* per scanline of the bitmap (JTRM Rev 8 p.20,
+                      * "Data width: number of phrases per scanline of image
+                      * data"), so the DATA pointer advances DWIDTH phrases =
+                      * DWIDTH*8 bytes per line.  The old mask (0xFFC0000)
+                      * started three bits lower and so also picked up the
+                      * PITCH field (bits 15-17), adding the phrase spacing
+                      * to the line stride: every line of every 16bpp bitmap
+                      * object was read one byte further along than it
+                      * should be, and the picture sheared by one byte per
+                      * line.  (PITCH is bits 15-17 and is used separately,
+                      * for the spacing between the phrases of one line.) */
+                     dwidth = (p1 & 0x3FC0000) >> 15;
                      data += dwidth;
 
                      p0 &= ~0xFFFFF80000FFC000LL;		// Mask out old data...
@@ -813,7 +825,19 @@ void OPProcessList(int halfline, bool render)
                      if (remainder < 0x20)
                      {
                         uint64_t data = (p0 & 0xFFFFF80000000000LL) >> 40;
-                        uint64_t dwidth = (p1 & 0xFFC0000) >> 15;
+                        uint64_t /* DWIDTH is bits 18-27 of the object's second phrase: the number of
+                      *phrases* per scanline of the bitmap (JTRM Rev 8 p.20,
+                      * "Data width: number of phrases per scanline of image
+                      * data"), so the DATA pointer advances DWIDTH phrases =
+                      * DWIDTH*8 bytes per line.  The old mask (0xFFC0000)
+                      * started three bits lower and so also picked up the
+                      * PITCH field (bits 15-17), adding the phrase spacing
+                      * to the line stride: every line of every 16bpp bitmap
+                      * object was read one byte further along than it
+                      * should be, and the picture sheared by one byte per
+                      * line.  (PITCH is bits 15-17 and is used separately,
+                      * for the spacing between the phrases of one line.) */
+                     dwidth = (p1 & 0x3FC0000) >> 15;
 
                         while (remainder < 0x20)
                         {
