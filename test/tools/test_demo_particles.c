@@ -115,7 +115,7 @@ static void png_write(const char *path, const uint8_t *rgba, unsigned w, unsigne
     for (i = 0; i < h; i++) {
         raw[i * (1 + (size_t)w * 3)] = 0;   /* filter: none */
         memcpy(raw + i * (1 + (size_t)w * 3) + 1,
-               rgba + i * (size_t)w * 4, (size_t)w * 3);
+               rgba + i * (size_t)w * 3, (size_t)w * 3);
     }
 
     /* zlib header */
@@ -198,9 +198,10 @@ static void demo_video_cb(void *userdata, const void *data,
             for (y = 0; y < h; y++) {
                 const uint8_t *row = (const uint8_t *)data + (size_t)y * pitch;
                 for (x = 0; x < w; x++) {
-                    st->rgb[(size_t)y * w * 3 + x * 3 + 0] = row[x * 4 + 0];
+                    /* the core hands back 32-bit XBGR little-endian */
+                    st->rgb[(size_t)y * w * 3 + x * 3 + 0] = row[x * 4 + 2];
                     st->rgb[(size_t)y * w * 3 + x * 3 + 1] = row[x * 4 + 1];
-                    st->rgb[(size_t)y * w * 3 + x * 3 + 2] = row[x * 4 + 2];
+                    st->rgb[(size_t)y * w * 3 + x * 3 + 2] = row[x * 4 + 0];
                 }
             }
             snprintf(path, sizeof(path), "%s/frame_%04u.png", st->out_dir,
@@ -251,6 +252,7 @@ int main(int argc, char **argv)
     uint8_t **ramp;
     demo_state st;
     const char *out_dir = NULL;
+    const char *ram_out = NULL;
     unsigned frames = 90;
     int i, failed = 0;
     const uint8_t *ram;
@@ -260,11 +262,13 @@ int main(int argc, char **argv)
             out_dir = argv[++i];
         } else if (!strcmp(argv[i], "--frames") && i + 1 < argc) {
             frames = (unsigned)atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--ram-out") && i + 1 < argc) {
+            ram_out = argv[++i];
         }
     }
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <core.so> <rom.j64> [--frames-out DIR] [--frames N]\n",
-                argv[0]);
+        fprintf(stderr, "usage: %s <core.so> <rom.j64> [--frames-out DIR] "
+                        "[--frames N] [--ram-out FILE]\n", argv[0]);
         return 2;
     }
 
@@ -301,6 +305,15 @@ int main(int argc, char **argv)
     harness_run(&cfg);
 
     ram = *ramp;
+    if (ram_out)
+    {
+        FILE *rf = fopen(ram_out, "wb");
+        if (rf)
+        {
+            fwrite(ram, 1, 2u * 1024u * 1024u, rf);
+            fclose(rf);
+        }
+    }
     printf("DEMO start=%08X done=%08X count=%u frame=%u\n",
            rd32(ram, DEMO_SENT_START), rd32(ram, DEMO_SENT_DONE),
            rd32(ram, DEMO_SENT_COUNT), rd32(ram, DEMO_SENT_FRAME));

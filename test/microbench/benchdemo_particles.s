@@ -117,6 +117,29 @@
 
         .include "cartboot.inc"
 
+; ---- the palette ----------------------------------------------------
+; 64 RGB555 words: a full hue wheel (red -> orange -> yellow -> green ->
+; cyan -> blue -> magenta -> red), each with the low bit set so the core's
+; MIX16 table decodes it as RGB16 rather than CRY.  The demo indexes the
+; palette with (particle + frame) & 63, so every particle walks the whole
+; wheel once per second and the burst shimmers through the spectrum.
+;
+; The table sits at the cart entry point itself, immediately behind a
+; branch that jumps over it: that gives it a FIXED address ($802004)
+; which the ROM can load with a plain immediate.  (A pointer built from
+; a label expression is section-relative in this assembler, so the
+; address is written out longhand instead.)
+        bra.w   start                     ; $802000: jump over the table
+PALETTE_SRC:
+        dc.w    $F801,$F807,$F80D,$F813,$F819,$F81F,$F823,$F829
+        dc.w    $F82F,$F835,$F83B,$F03F,$D83F,$C03F,$A83F,$903F
+        dc.w    $803F,$683F,$503F,$383F,$203F,$083F,$00BF,$017F
+        dc.w    $023F,$02FF,$03BF,$043F,$04FF,$05BF,$067F,$073F
+        dc.w    $07FF,$07F9,$07F3,$07ED,$07E7,$07E1,$07DD,$07D7
+        dc.w    $07D1,$07CB,$07C5,$0FC1,$27C1,$3FC1,$57C1,$6FC1
+        dc.w    $87C1,$97C1,$AFC1,$C7C1,$DFC1,$F7C1,$FF41,$FE81
+        dc.w    $FDC1,$FD01,$FC41,$FBC1,$FB01,$FA41,$F981,$F8C1
+
 ; --- TOM registers ---------------------------------------------------
         TOM_OLP_LO     .equ    $00F00020
         TOM_OLP_HI     .equ    $00F00022
@@ -347,47 +370,30 @@ shclr2:
         dbra    d1,shclr2
 
 
-; ---- 4b. build the colour palette -----------------------------------
-; 64 random RGB555 words.  Computing the colour per particle per frame
-; cost ~20 instructions each, which is a quarter of the whole drawing
-; budget; a table lookup is one read.  The particle's palette index is
-; (particle + frame) & 63, so the hue still rotates every frame.
-        move.l  #$0000C0DE,d0
-        move.l  #PALETTE,a5
+; ---- 4b. copy the colour palette into RAM ----------------------------
+; The table is 64 words of RGB555 (a full hue wheel); the demo indexes it
+; with (particle + frame) & 63, so the burst shimmers through the spectrum
+; and every particle changes colour as it flies.
+        move.l  #$00802004,a0             ; PALETTE_SRC (a fixed cart address)
+        move.l  #PALETTE,a1
         move.w  #63,d1
-palbuild:
-        addi.l  #WELLY_STEP,d0          ; the next seed
-        move.l  d0,d2                   ; red = ((seed >> 16) & 0x1F) << 11
-        moveq   #16,d4
-        lsr.l   d4,d2
-        andi.l  #$001F,d2
-        lsl.l   #3,d2
-        lsl.l   #8,d2
-        move.l  d0,d3                   ; green = (seed >> 8) & 0x3F
-        moveq   #8,d4
-        lsr.l   d4,d3
-        andi.l  #$003F,d3
-        or.l    d3,d2
-        move.l  d0,d3                   ; blue = ((seed >> 3) & 0x1F) << 6
-        moveq   #3,d4
-        lsr.l   d4,d3
-        andi.l  #$001F,d3
-        lsl.l   #6,d3
-        or.l    d3,d2
-        ori.l   #$0001,d2                ; bit0 = "this pixel is RGB, not CRY"
-        move.l  d2,(a5)
-        addq.l  #4,a5
-        dbra    d1,palbuild
+palcopy:
+        move.w  (a0),d0
+        move.w  d0,(a1)
+        addq.l  #2,a0
+        addq.l  #2,a1
+        dbra    d1,palcopy
 
 
 ; ---- 5. clear both framebuffers -------------------------------------
-; The clear stores LONGWORDS, and a longword holds two pixels -- so the
-; background colour has to be in BOTH halves of the word.  With the
-; colour in one half only, every other pixel of the screen rendered as
-; CRY grey (the core's MIX16 table picks RGB16 or CRY from bit 0 of the
-; pixel), which showed up as vertical stripes across the picture.
-        move.w  #BG_COLOUR,d0
-        swap    d0
+; The clear stores LONGWORDS and a longword holds TWO pixels, so the
+; background colour has to be in BOTH halves -- $0001_0001, not
+; $0001_0000.  Half a colour is not a cosmetic detail: a $0000 pixel is
+; decoded by the core's MIX16 table as CRY (bit 0 clear) instead of
+; RGB16, and CRY 0 renders as a faint red rather than black.  The result
+; was a screen-wide dither of dark red/green/blue, with solid bands
+; where the erase pass had written proper $0001 words over it.
+        move.l  #$00010001,d0                ; BG_COLOUR in both halves
         move.w  #((SCR_H*SCR_W)/2)-1,d1  ; 38400 longword stores
         move.l  #FB_A,a0
 fbclrA:
@@ -549,10 +555,10 @@ py_done:
         move.l  d2,d0
         add.l   d3,d0                    ; colour phase = index + frame
         andi.l  #$003F,d0
-        lsl.l   #2,d0
+        add.l   d0,d0                     ; entries are WORDS, not longs
         move.l  #PALETTE,a0
-        add.l   a0,d0
-        move.l  (a0),d6                 ; the colour word
+        add.l   d0,a0                     ; (the indexed form is broken in
+        move.w  (a0),d6                   ;  this assembler: scale is bytes)
 
         ; --- draw the new position in the particle's colour
         jsr     draw_block

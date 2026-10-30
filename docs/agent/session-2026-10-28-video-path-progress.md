@@ -546,3 +546,89 @@ reproduced against a **pristine** build of the pinned toolchain:
 
 The file also keeps a **"Claims that did not reproduce"** section, with
 the reason each was wrong, so the false ones are not filed again.
+
+## 10. UPDATE (2026-10-30) — the trail, the band, and the "colours" were all one bug each
+
+Three complaints about the demo ("comet trails survive", "a band across
+the bottom third", "it is all yellow") turned out to be three separate,
+small, *tool-side* or *ROM-side* bugs — the core's OP rendering was
+correct the whole time.  They are worth writing down because the first
+two had been blamed on the core.
+
+### 10.1 The framebuffer clear wrote half a colour
+
+The clear stores LONGWORDS, and a longword is two 16-bit pixels, but the
+colour was only in one half:
+
+    move.w  #BG_COLOUR,d0      ; d0 = $0000_0001
+    swap    d0                 ; d0 = $0001_0000   <- still only one half
+
+so every other pixel was `$0001` (RGB16 black) and `$0000` (bit 0
+clear => the core's MIX16 table decodes it as **CRY**, and CRY 0 is a
+faint red, not black).  The result was a screen-wide dither of dark
+red/green/blue, plus solid bands wherever the *erase* pass had written
+proper `$0001` words over it.  That was the "band across the bottom
+third".  The fix is one line: `move.l #$00010001,d0`.
+
+### 10.2 The PNG dumper walked the RGB buffer at 4 bytes per pixel
+
+`png_write()` copied each row out of the frame buffer with
+
+    rgba + i * w * 4
+
+but the buffer it was handed was `w * h * 3` (the callback had already
+packed RGB).  Every row therefore started 4/3 of a row further along
+than the last, which produced a perfect 3-pixel R/G/B cycle — diagonal
+smearing that read as "vertical stripes" and "comet trails" in every
+screenshot the demo had ever produced.  The callback also copied bytes
+0,1,2 in order, but the core hands back 32-bit **XBGR** little-endian,
+so red and blue were swapped on top of that.
+
+Lesson: the frame-dump path is part of the measurement apparatus.  A
+renderer bug and a dumper bug look the same in a PNG.  `--ram-out FILE`
+now exists on `test_demo_particles` so the framebuffer can be inspected
+directly: with a correct ROM the 16-bit words are exactly the
+background word plus N distinct particle colours, 4 pixels each, and any
+disagreement with the PNG is the dumper's fault.
+
+### 10.3 "All yellow" — the particle colour lookup
+
+The palette was built from an LCG seed, and the visible result was
+yellow-ish because green (6 bits) dominated red (5) and blue (5) for the
+values the LCG produced.  The lookup itself was also broken twice over:
+
+    lsl.l   #2,d0            ; palette entries are WORDS, not longs
+    move.l  #PALETTE,a0
+    add.l   a0,d0            ; ...and the sum was left in d0
+    move.l  (a0),d6          ; while the load used a0, unindexed
+
+so every particle read the same two words and drew the same colour.  The
+palette is now a **64-entry hue wheel** (red -> yellow -> green -> cyan ->
+blue -> magenta -> red, RGB555 with bit 0 set so the core decodes it as
+RGB16), emitted as `dc.w` data at a fixed cart address and copied to RAM
+at startup, and the index is `(particle + frame) & 63`: every particle
+is a different hue, and every hue advances 5.6 degrees per field.
+
+The table sits at `$802004`, immediately after a `bra.w start` at the
+entry point, because an immediate built from a label expression is
+section-relative in this assembler — a *fixed* address is the one thing
+that always links correctly.
+
+### 10.4 The demo runner grew an audio mode and a WAV mode
+
+`test/microbench/run_demo.sh` now takes `particles | vidprobe | audio`,
+`--wav [FILE]` (headless: run the core, capture the audio callback and
+write a 48 kHz stereo WAV — no emulator needed), and `bigpemu` (launch
+the ROM in the flathub BigPEmu, as an independent implementation to
+compare against).  The WAV writer in `test_demo_audio.c` needed one
+non-obvious fix: the WAV `nBlockAlign` field is **two** bytes, and a
+four-byte write there shifts every following field, which is what
+"no 'data' tag found" from ffmpeg actually meant.
+
+### 10.5 State
+
+`make demos` passes: `particle_demo`, four audio assertions, and the 16
+68000 ALU forms.  A rendered frame is a clean black background with 64
+two-pixel rainbow blocks (256 lit pixels, 65 distinct framebuffer words
+including the background) and no trails, because the shadow table erases
+exactly what each buffer holds.

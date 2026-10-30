@@ -28,7 +28,10 @@
  * rate is reported next to the nominal one so that difference is
  * visible rather than hidden.
  *
- * Usage:  test_demo_audio <core.so> <rom.j64> [--frames N]
+ * Usage:  test_demo_audio <core.so> <rom.j64> [--frames N] [--wav FILE]
+ *
+ * --wav writes what the core's audio callback produced as a 48 kHz
+ * stereo WAV, so the demo can be heard without an emulator frontend.
  */
 
 #include <stdio.h>
@@ -58,6 +61,35 @@ static uint32_t rd32(const uint8_t *p)
 {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16)
          | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+/* Write the captured audio as a 16-bit stereo RIFF/WAVE file, so the
+ * demo can be heard without an emulator (any player will do). */
+static int write_wav(const char *path, const int16_t *samples, size_t frames)
+{
+    FILE *f;
+    uint32_t data_bytes = (uint32_t)(frames * 4u);
+    uint32_t riff_size = 36u + data_bytes;
+    uint16_t one = 1, chans = 2, bits = 16, block = 4;
+    uint32_t rate = RATE, byte_rate = RATE * 4u, fmt = 16;
+
+    f = fopen(path, "wb");
+    if (!f) { fprintf(stderr, "write_wav: cannot open %s\n", path); return 1; }
+    fwrite("RIFF", 1, 4, f);
+    fwrite(&riff_size, 4, 1, f);
+    fwrite("WAVEfmt ", 1, 8, f);
+    fwrite(&fmt, 4, 1, f);
+    fwrite(&one, 2, 1, f);
+    fwrite(&chans, 2, 1, f);
+    fwrite(&rate, 4, 1, f);
+    fwrite(&byte_rate, 4, 1, f);
+    fwrite(&block, 2, 1, f);      /* nBlockAlign is TWO bytes */
+    fwrite(&bits, 2, 1, f);
+    fwrite("data", 1, 4, f);
+    fwrite(&data_bytes, 4, 1, f);
+    fwrite(samples, 4, frames, f);
+    fclose(f);
+    return 0;
 }
 
 static void audio_batch(const int16_t *buf, size_t frames)
@@ -95,6 +127,7 @@ int main(int argc, char **argv)
     harness_config cfg = HARNESS_CONFIG_DEFAULT;
     void (*set_batch)(void (*)(const int16_t *, size_t));
     unsigned frames = 120;
+    const char *wav_path = NULL;
     size_t i, pairs;
     int peak = 0, nonsilent = 0, mismatch = 0;
     int crossings = 0;
@@ -105,14 +138,16 @@ int main(int argc, char **argv)
 
     if (argc < 3)
     {
-        fprintf(stderr, "usage: %s <core.so> <rom.j64> [--frames N]\n",
-                argv[0]);
+        fprintf(stderr, "usage: %s <core.so> <rom.j64> [--frames N] "
+                        "[--wav FILE]\n", argv[0]);
         return 2;
     }
     for (i = 2; i < (size_t)argc; i++)
     {
         if (!strcmp(argv[i], "--frames") && i + 1 < (size_t)argc)
             frames = (unsigned)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--wav") && i + 1 < (size_t)argc)
+            wav_path = argv[++i];
     }
 
     cfg.frames = frames;
@@ -160,8 +195,19 @@ int main(int argc, char **argv)
     g_tick_last = rd32(*g_ramp + TICK_ADDR);
 
     pairs = g_count / 2;
-    printf("AUDIO sample_frames=%lu  dropped=%llu\n",
+    printf("AUDIO sample_frames=%lu  dropped=%lu\n",
            (unsigned long)pairs, (unsigned long)g_dropped);
+
+    if (wav_path)
+    {
+        if (write_wav(wav_path, g_samples, pairs))
+        {
+            harness_shutdown(&cfg);
+            return 2;
+        }
+        printf("AUDIO wrote %s (%lu frames, %.2f s at %d Hz)\n", wav_path,
+               (unsigned long)pairs, (double)pairs / (double)RATE, RATE);
+    }
 
     if (pairs < 100)
     {

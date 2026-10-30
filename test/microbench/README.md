@@ -576,13 +576,17 @@ this core:
 | ROM | what it shows |
 |---|---|
 | `benchdemo_vidprobe.j64` | a full-screen gradient — the smallest ROM that proves the Object Processor path |
-| `benchdemo_particles.j64` | 256 particles exploding from the screen centre, each with its own colour, on a 320×240 screen |
+| `benchdemo_particles.j64` | 64 particles exploding from the screen centre, each a different hue, on a 320×240 screen |
+| `benchdemo_audio.j64` | a 68K-only I2S square wave (~2.75 kHz, stereo) — the audio path end to end |
 
-Watch them in RetroArch:
+Watch them in RetroArch, or listen to the audio one without an emulator:
 
 ```bash
 test/microbench/run_demo.sh              # the particle explosion
 test/microbench/run_demo.sh vidprobe     # the gradient probe
+test/microbench/run_demo.sh audio        # the square wave, in RetroArch
+test/microbench/run_demo.sh audio --wav  # ...or straight to a .wav file
+test/microbench/run_demo.sh bigpemu      # run it in BigPEmu instead
 ```
 
 The script copies the freshly built core into RetroArch's cores directory
@@ -590,10 +594,22 @@ and launches it with the ROM loaded.  It needs RetroArch
 (`flatpak install --user flathub org.libretro.RetroArch`); if RetroArch is
 not installed it prints that command and exits.
 
+`--wav` needs no emulator at all: it runs the core headless (through
+`test/tools/test_demo_audio`), captures what the audio callback produced
+and writes a plain 48 kHz stereo WAV, then hands it to the desktop's
+default player.  That is the quickest way to hear the demo, and the file
+is also something a regression can be diffed against.
+
+`bigpemu` launches the same ROM in BigPEmu (`flatpak install --user
+flathub com.richwhitehouse.BigPEmu`), which is a useful second opinion:
+the two emulators are independent implementations, so if they disagree
+about a ROM one of them has a real bug.
+
 `test/tools/test_demo_particles.c` is the headless counterpart: it runs a
 demo ROM, counts the lit pixels, dumps every frame as a PNG
-(`--frames-out DIR`) and asserts that the simulation actually moved the
-particles.  Sample output is committed under `docs/images/`.
+(`--frames-out DIR`), can dump the 2 MB of main RAM (`--ram-out FILE`)
+and asserts that the simulation actually moved the particles.  Sample
+output is committed under `docs/images/`.
 
 ### The recipe — how a 16-bpp Jaguar bitmap reaches the screen
 
