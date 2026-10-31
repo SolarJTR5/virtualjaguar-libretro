@@ -12,6 +12,9 @@
 #               the Object Processor path works
 #   audio       the 68K-only I2S square wave (about 2.75 kHz, stereo);
 #               there is no video, so the screen stays black
+#   sine        the same I2S path driven with a 64-step sine table
+#               (about 649 Hz): the waveform the 32X PWM test measures,
+#               so the two machines' audio paths can be compared
 #
 # Usage:
 #   test/microbench/run_demo.sh                  # particles, in RetroArch
@@ -19,6 +22,7 @@
 #   test/microbench/run_demo.sh audio            # listen in RetroArch
 #   test/microbench/run_demo.sh audio --wav      # render a WAV and play it
 #   test/microbench/run_demo.sh audio --wav out.wav
+#   test/microbench/run_demo.sh sine --wav       # the sine, as a WAV
 #   test/microbench/run_demo.sh bigpemu audio    # a second, independent
 #                                                # emulator as an oracle
 #   test/microbench/run_demo.sh particles -- -f  # extra emulator flags
@@ -43,12 +47,12 @@ mode=retroarch
 wav_path=""
 extra_args=()
 
-usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
-        particles|vidprobe|audio) which_demo="$1"; shift ;;
+        particles|vidprobe|audio|sine) which_demo="$1"; shift ;;
         bigpemu) mode=bigpemu; shift ;;
         --wav)
             mode=wav
@@ -64,6 +68,7 @@ done
 case "$which_demo" in
     vidprobe) rom="$here/benchdemo_vidprobe.j64" ;;
     audio)    rom="$here/benchdemo_audio.j64" ;;
+    sine)     rom="$here/benchdemo_sine.j64" ;;
     *)        rom="$here/benchdemo_particles.j64" ;;
 esac
 
@@ -83,7 +88,11 @@ if [ "$mode" = wav ]; then
         wav_path="${TMPDIR:-/tmp}/jaguar_audio_demo.wav"
     fi
     echo "==> capturing $which_demo audio into $wav_path"
-    "$tool" "$core" "$rom" --frames 240 --wav "$wav_path"
+    if [ "$which_demo" = sine ]; then
+        "$tool" "$core" "$rom" --frames 240 --sine --wav "$wav_path"
+    else
+        "$tool" "$core" "$rom" --frames 240 --wav "$wav_path"
+    fi
     echo
     if command -v xdg-open >/dev/null 2>&1 && [ -z "${VJ_NO_PLAY:-}" ]; then
         echo "==> playing it"

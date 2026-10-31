@@ -578,6 +578,7 @@ this core:
 | `benchdemo_vidprobe.j64` | a full-screen gradient — the smallest ROM that proves the Object Processor path |
 | `benchdemo_particles.j64` | 64 particles exploding from the screen centre, each a different hue, on a 320×240 screen |
 | `benchdemo_audio.j64` | a 68K-only I2S square wave (~2.75 kHz, stereo) — the audio path end to end |
+| `benchdemo_sine.j64` | the same I2S path driven from a 64-step sine table (~649 Hz) — the waveform the 32X PWM test measures, so the two machines' audio paths can be compared |
 
 Watch them in RetroArch, or listen to the audio one without an emulator:
 
@@ -586,6 +587,7 @@ test/microbench/run_demo.sh              # the particle explosion
 test/microbench/run_demo.sh vidprobe     # the gradient probe
 test/microbench/run_demo.sh audio        # the square wave, in RetroArch
 test/microbench/run_demo.sh audio --wav  # ...or straight to a .wav file
+test/microbench/run_demo.sh sine --wav   # the sine wave, as a .wav
 test/microbench/run_demo.sh bigpemu      # run it in BigPEmu instead
 ```
 
@@ -604,6 +606,41 @@ is also something a regression can be diffed against.
 flathub com.richwhitehouse.BigPEmu`), which is a useful second opinion:
 the two emulators are independent implementations, so if they disagree
 about a ROM one of them has a real bug.
+
+One disagreement that is already known: **BigPEmu 1.221 boots
+`test/roms/yarc.j64` from the command line but shows its own menu
+instead of running any of the homebrew carts here** (reproduced with
+`benchdemo_particles.j64`, and with the same image padded to 1 MiB, so
+it is not the odd 9 KB file size).  The core boots them through its HLE
+path.  These carts fill $800000-$8003FF (the encrypted BootIntro block
+on a retail cart) with zeros, which is the usual suspect; it is not yet
+proven.
+
+### The sine, and how it is measured
+
+`benchdemo_sine.j64` is `benchdemo_audio.j64` with the square wave
+replaced by a 64-entry sine table, and it is measured rather than merely
+heard.  `test_demo_audio --sine` captures the output and fits a pure sine
+to it, reporting the three numbers the Sega 32X PWM test reports:
+
+```
+AUDIO ticks=82329 over 20000 frames -> tick rate 41164 Hz (nominal 41548 Hz), expected tone 649 Hz
+AUDIO sine fit: 648.60 Hz (expected 649.19 Hz), amplitude 15980/32767 (-6.2 dBFS), SNR vs a pure sine 33.3 dB, L/R correlation 1.00000
+```
+
+The two rates that matter are the timer tick and the I2S word strobe, and
+they are **set equal on purpose** (PIT divider 640 cycles = 41.55 kHz,
+SCLK = 9 = 26.590906 MHz / (64 x 10) = 41.55 kHz).  The DAC has no FIFO,
+only the two transmit registers, so a sample written faster than the
+strobes is dropped and one written slower is held for two strobes; either
+way the sine acquires jitter, which is distortion.  Rate-locking them is
+what turns a 28.9 dB fit into a 33.3 dB one.
+
+The square wave's expected pitch comes from the *measured* tick rate
+(its ISR really does swallow ticks, and the harness says so).  The sine's
+does not: with the two clocks locked the pitch is predictable to well
+under 1%, so a fit that misses it means they have drifted apart — an ISR
+overrun is the usual cause.
 
 `test/tools/test_demo_particles.c` is the headless counterpart: it runs a
 demo ROM, counts the lit pixels, dumps every frame as a PNG

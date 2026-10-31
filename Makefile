@@ -3640,10 +3640,12 @@ microbench:
 		./$$t ./$(TARGET) "$$rom"; \
 	done
 
-# `make demos` -- run the three demo-ROM tools: the particle explosion
-# (the video path end to end), the 68K-only I2S square wave (the audio
-# path end to end), and the 68000 ALU conformance probe (the assembler's
-# register-register forms against the 68000's documented answers).
+# `make demos` -- run the four demo-ROM tools: the particle explosion
+# (the video path end to end), the 68K-only I2S square wave and the I2S
+# sine (the audio path end to end, the second one measured with a
+# least-squares fit the way the 32X PWM test is), and the 68000 ALU
+# conformance probe (the assembler's register-register forms against the
+# 68000's documented answers).
 .PHONY: demos
 demos: export VJ_EXPECT_BUILD := $(shell ./scripts/build-id.sh)
 demos:
@@ -3654,6 +3656,8 @@ demos:
 		test/microbench/benchdemo_particles.j64
 	./test/tools/test_demo_audio ./$(TARGET) \
 		test/microbench/benchdemo_audio.j64
+	./test/tools/test_demo_audio ./$(TARGET) \
+		test/microbench/benchdemo_sine.j64 --sine
 	./test/tools/test_demo_alu ./$(TARGET) \
 		test/microbench/benchdemo_alu.j64
 

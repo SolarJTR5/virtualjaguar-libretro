@@ -632,3 +632,94 @@ four-byte write there shifts every following field, which is what
 two-pixel rainbow blocks (256 lit pixels, 65 distinct framebuffer words
 including the background) and no trails, because the shadow table erases
 exactly what each buffer holds.
+
+## 11. UPDATE (2026-10-30, later) — the 32X sine test, on the Jaguar
+
+### 11.1 What was asked
+
+"Can we emulate a similar test like what the 32X example does with my sine
+wave test?"  The 32X test (`projects-sdraylib/audio/32x/docs/pwm_protocol.md`)
+plays a 32-step sine through the PWM port and then, instead of trusting
+its ears, *fits* the captured audio and reports three numbers:
+
+```
+  the fitted frequency: 689.54 Hz          (the rate / 32)
+  the fitted amplitude: 31368.8 (-0.4 dBFS)
+  the SNR vs a pure sine: 44.5 dB
+```
+
+### 11.2 The ROM
+
+`test/microbench/benchdemo_sine.j64` (`benchdemo_sine.s`) is
+`benchdemo_audio.j64` with the two-level square replaced by a 64-entry
+sine table (`dc.w`, +/-16000) at the fixed cart address `$802004`, behind
+the usual `bra.w start`.  The ISR builds the table pointer by hand
+(`index -> <<1 -> add to the base, then a plain (An) load`) because the
+indexed forms are the ones this assembler mis-encodes.
+
+### 11.3 The one design decision that mattered
+
+The DAC has **no FIFO** -- only the LTXD/RTXD transmit registers -- so
+samples must be delivered at exactly the word-strobe rate.  Write faster
+and samples are dropped; write slower and each is held for two strobes.
+Either way the sine picks up jitter, and jitter on a sine is distortion
+in a way that it is not on a square wave.
+
+| PIT divider | tick rate | tone | SNR vs a pure sine |
+|---|---|---|---|
+| 576 cycles, SCLK 8 (46.16 kHz) | 45.4 kHz measured | 716 Hz | 28.9 dB |
+| 640 cycles, SCLK 9 (41.55 kHz) | 41.2 kHz measured | 649 Hz | **33.3 dB** |
+
+Both rows deliver the same total power; the second one *rate-locks* the
+timer to the strobe, so every sample is latched exactly once.  It also
+fixed an L/R artefact: the two transmit registers are written a few
+cycles apart, so a strobe landing between the two writes latches
+adjacent samples -- 7% of frames at the first setting, **0 frames** at
+the second.
+
+### 11.4 The harness
+
+`test_demo_audio --sine` does a least-squares sine fit (projection onto
+cos/sin at a trial frequency, coarse scan plus three refinements) over
+the middle half of the capture, and reports fitted frequency, amplitude
+in dBFS, SNR and the L/R correlation.  Checks: `audio_present`,
+`audio_stereo_match` (correlation >= 0.99, because "same bytes" is the
+wrong test for two registers written a few cycles apart),
+`sine_frequency` (+-2% of the *nominal* rate / 64), `audio_timer_rate`,
+`sine_purity` (SNR >= 25 dB).
+
+The square's expected pitch is derived from the measured tick rate (its
+ISR really does swallow ticks).  The sine's is derived from the nominal
+one, because the two clocks are locked and the pitch is then predictable
+to 0.09% -- which is what makes the check sharp enough to catch a drift.
+
+### 11.5 bigPEmu, the BIOS, and a reproducible disagreement
+
+- The core needs no BIOS: HLE boot by default, with both console boot
+  ROMs embedded (`src/bios/jagbios.c` = Series K, `jagbios_m.c` = Model
+  M), selectable with `Cart BIOS Type`.  The user's `[BIOS] Atari Jaguar
+  (World).j64` was copied into the RetroArch `system/` directory, where
+  the core's `Custom` search finds it by that exact name (`docs/bios.md`).
+- BigPEmu 1.221 had **no** boot ROM configured (`~/.bigpemu_userdata/
+  BigPEmuConfig.bigpcfg` has no `BootROM` key).  The same image was
+  copied to `~/.bigpemu_userdata/bios.j64` and a `"BootROM"` key added
+  to the config's `System` block -- unverified, because that config is
+  only rewritten on a clean GUI exit and its window is native Wayland,
+  so it cannot be driven (not with xdotool; not with `SDL_VIDEODRIVER=
+  x11`, which fails inside the flatpak with "one or more vital systems
+  failed to initialize").
+- **Reproducible disagreement:** `flatpak run com.richwhitehouse.BigPEmu
+  test/roms/yarc.j64` boots the retail cart and renders it; the same
+  command with `benchdemo_particles.j64` (or the sine ROM, or the
+  particles image padded to 1 MiB) shows BigPEmu's own menu instead.
+  So BigPEmu is not (currently) a usable oracle for these homebrew
+  carts, and the zeroed BootIntro block at $800000-$8003FF is the
+  standing suspect.  Not claimed as a bug in either emulator until the
+  boot path is read.
+
+### 11.6 State
+
+`make demos` runs four tools: particle demo, square wave (4 checks), sine
+(5 checks) and the 16 68000 ALU forms.  `run_demo.sh` gained a `sine`
+mode, so `run_demo.sh sine --wav` renders the fitted sine to a WAV and
+plays it with no emulator at all.
